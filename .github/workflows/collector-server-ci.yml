@@ -1,3 +1,5 @@
+File: collector-server/.github/workflows/collector-server-ci.yml
+---
 name: collector-server-ci
 
 on:
@@ -13,21 +15,6 @@ jobs:
     permissions:
       contents: read
 
-    services:
-      mariadb:
-        image: mariadb:11.4
-        env:
-          MARIADB_ROOT_PASSWORD: Rainbow01!
-          TZ: Asia/Seoul
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mariadb-admin ping -h 127.0.0.1 -uroot -pRainbow01! --silent"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-          --health-start-period=20s
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -37,71 +24,41 @@ jobs:
         with:
           node-version: "18"
 
-      - name: Install MariaDB client
+      - name: Load Environment Variables
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mariadb-client
-
-      - name: Wait for MariaDB
-        run: |
-          for i in {1..30}; do
-            if mariadb-admin ping -h 127.0.0.1 -uroot -pRainbow01! --silent; then
-              exit 0
-            fi
-            sleep 2
-          done
-          exit 1
-
-      - name: Initialize schema
-        run: |
-          mariadb -h 127.0.0.1 -uroot -pRainbow01! < ci/init-mariadb.sql
+          if [ -f ci/test.env ]; then
+            grep -v '^[[:space:]]*#' ci/test.env | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
+          fi
 
       - name: Install dependencies
         run: npm install
 
-      - name: Verify Dockerfile build
-        run: docker build -t rainbow-collector-server:ci .
-
-      - name: Start collector-server
-        env:
-          PORT: 8080
-          TRUST_PROXY: "0"
-          API_KEY: local-dev-test-key-12345
-          DB_HOST: 127.0.0.1
-          DB_PORT: 3306
-          DB_USER: backend_admin
-          DB_PASSWORD: Back@end#01!
-          DB_DATABASE: ingest_backend_db
-          DB_CONN_LIMIT: 10
-          TASK_NAME: SessionFlow
-          WORKFLOW_IDLE_MS: 120000
-          API_PATH_MAX: 1024
+      - name: Start smoke stack
         run: |
-          nohup node server.js > collector-server.log 2>&1 &
-          echo $! > collector-server.pid
+          docker compose --project-directory . -f ci/compose.smoke.yml up -d --build
 
       - name: Wait for healthz
         run: |
           for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+            if curl -fsS http://127.0.0.1:${PORT}/healthz >/dev/null; then
               exit 0
             fi
             sleep 2
           done
-          cat collector-server.log
+          docker compose --project-directory . -f ci/compose.smoke.yml logs
           exit 1
 
       - name: Send smoke ingest request
         run: |
-          curl -fsS -X POST "http://127.0.0.1:8080/ingest/batch?api_key=local-dev-test-key-12345" \
+          curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest/batch?api_key=${API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{"rows":[{"AZ_event_id":"ci-smoke-1","AZ_event_time":"2026-03-24 17:30:00.000000","AZ_event_action":"page_view","AZ_element_type":"page","AZ_url":"https://example.com/dashboard","AZ_page_title":"CI Smoke","AZ_session_page_id":"ci-session-1","AZ_session_browser_id":"ci-browser-1","AZ_login_id":"ci-user-1"}]}'
 
       - name: Verify DB insert
         run: |
-          EVENT_COUNT=$(mariadb -h 127.0.0.1 -N -ubackend_admin -p'Back@end#01!' ingest_backend_db -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1';")
-          SESSION_COUNT=$(mariadb -h 127.0.0.1 -N -ubackend_admin -p'Back@end#01!' ingest_backend_db -e "SELECT COUNT(*) FROM sessions WHERE id='ci-session-1';")
-          TASK_COUNT=$(mariadb -h 127.0.0.1 -N -ubackend_admin -p'Back@end#01!' ingest_backend_db -e "SELECT COUNT(*) FROM tasks WHERE session_id='ci-session-1';")
+          EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1';")
+          SESSION_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM sessions WHERE id='ci-session-1';")
+          TASK_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM tasks WHERE session_id='ci-session-1';")
           test "$EVENT_COUNT" = "1"
           test "$SESSION_COUNT" = "1"
           test "$TASK_COUNT" = "1"
@@ -109,9 +66,9 @@ jobs:
       - name: Dump logs
         if: always()
         run: |
-          test -f collector-server.log && cat collector-server.log || true
+          docker compose --project-directory . -f ci/compose.smoke.yml logs --no-color || true
 
-      - name: Stop collector-server
+      - name: Stop smoke stack
         if: always()
         run: |
-          test -f collector-server.pid && kill "$(cat collector-server.pid)" || true
+          docker compose --project-directory . -f ci/compose.smoke.yml down -v --remove-orphans || true
