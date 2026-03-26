@@ -1,50 +1,75 @@
-# name: collector-server-cd
+name: collector-server-cd
 
-# on:
-#   workflow_run:
-#     workflows:
-#       - collector-server-ci
-#     types:
-#       - completed
+on:
+  workflow_run:
+    workflows:
+      - collector-server-ci
+    types:
+      - completed
 
-# jobs:
-#   publish-image:
-#     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
-#     runs-on: ubuntu-latest
-#     permissions:
-#       contents: read
-#       packages: write
+concurrency:
+  group: collector-test-deploy
+  cancel-in-progress: true
 
-#     steps:
-#       - name: Checkout target revision
-#         uses: actions/checkout@v6
-#         with:
-#           ref: ${{ github.event.workflow_run.head_sha }}
-        
-#       - name: Prepare image metadata
-#         run: |
-#           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-#           SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
-#           echo "IMAGE_URI=ghcr.io/${OWNER_LC}/collector-server" >> "$GITHUB_ENV"
-#           echo "IMAGE_TAG_SHA=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+jobs:
+  deploy-test:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'dev' }}
+    runs-on: [self-hosted, linux, x64, collector-test]
+    permissions:
+      contents: read
 
-#       - name: Log in to GHCR
-#         run: |
-#           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+    steps:
+      - name: Checkout target revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
-#       - name: Build image
-#         run: |
-#           docker build \
-#             -t "${IMAGE_URI}:latest" \
-#             -t "${IMAGE_URI}:${IMAGE_TAG_SHA}" \
-#             .
+      - name: Write runtime env
+        shell: bash
+        run: |
+          cat > .env <<'EOF'
+          ${{ secrets.COLLECTOR_ENV_TEST }}
+          EOF
 
-#       - name: Push image
-#         run: |
-#           docker push "${IMAGE_URI}:latest"
-#           docker push "${IMAGE_URI}:${IMAGE_TAG_SHA}"
+      - name: Export env
+        shell: bash
+        run: |
+          grep -v '^[[:space:]]*#' .env | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
 
-#       - name: Output published tags
-#         run: |
-#           echo "Published: ${IMAGE_URI}:latest"
-#           echo "Published: ${IMAGE_URI}:${IMAGE_TAG_SHA}"
+      - name: Ensure docker network exists
+        run: |
+          docker network inspect collector-test-net >/dev/null 2>&1 || docker network create collector-test-net
+
+      - name: Check DB container
+        run: |
+          docker inspect rainbow-mariadb-test >/dev/null 2>&1
+
+      - name: Stop existing app container
+        run: |
+          docker rm -f collector-server-test || true
+
+      - name: Build image locally
+        run: |
+          docker build -t collector-server:test .
+
+      - name: Start app container
+        run: |
+          docker run -d \
+            --name collector-server-test \
+            --restart unless-stopped \
+            --network collector-test-net \
+            -p "${PORT}:${PORT}" \
+            --env-file .env \
+            collector-server:test
+
+      - name: Wait for healthz
+        shell: bash
+        run: |
+          for i in {1..30}; do
+            if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs collector-server-test || true
+          exit 1
