@@ -1,0 +1,29 @@
+services:
+  mariadb:
+    image: mariadb:11.4
+    env_file:
+      - ./ci/test.env
+    environment:
+      TZ: ${TZ}
+    ports:
+      - "${DB_PORT}:${DB_PORT}"
+    volumes:
+      - ./ci/init-mariadb.sql:/docker-entrypoint-initdb.d/init-mariadb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p$$MARIADB_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  collector-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ./ci/test.env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    ports:
+      - "${PORT}:${PORT}"

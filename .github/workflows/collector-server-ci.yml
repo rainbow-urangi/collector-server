@@ -1,0 +1,72 @@
+name: collector-server-ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "18"
+
+      - name: Load Environment Variables
+        run: |
+          if [ -f ci/test.env ]; then
+            grep -v '^[[:space:]]*#' ci/test.env | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
+          fi
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Start smoke stack
+        run: |
+          docker compose --project-directory . -f ci/compose.smoke.yml up -d --build
+
+      - name: Wait for healthz
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:${PORT}/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose --project-directory . -f ci/compose.smoke.yml logs
+          exit 1
+
+      - name: Send smoke ingest request
+        run: |
+          curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest/batch?api_key=${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"rows":[{"AZ_event_id":"ci-smoke-1","AZ_event_time":"2026-03-24 17:30:00.000000","AZ_event_action":"page_view","AZ_element_type":"page","AZ_url":"https://example.com/dashboard","AZ_page_title":"CI Smoke","AZ_session_page_id":"ci-session-1","AZ_session_browser_id":"ci-browser-1","AZ_login_id":"ci-user-1"}]}'
+
+      - name: Verify DB insert
+        run: |
+          EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1';")
+          SESSION_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM sessions WHERE id='ci-session-1';")
+          TASK_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM tasks WHERE session_id='ci-session-1';")
+          test "$EVENT_COUNT" = "1"
+          test "$SESSION_COUNT" = "1"
+          test "$TASK_COUNT" = "1"
+
+      - name: Dump logs
+        if: always()
+        run: |
+          docker compose --project-directory . -f ci/compose.smoke.yml logs --no-color || true
+
+      - name: Stop smoke stack
+        if: always()
+        run: |
+          docker compose --project-directory . -f ci/compose.smoke.yml down -v --remove-orphans || true
