@@ -1,71 +1,10 @@
 name: collector-server-cd-dev
 
 on:
-  push:
-    branches:
-      - dev
   workflow_dispatch:
 
-concurrency:
-  group: collector-test-deploy-dev
-  cancel-in-progress: true
-
 jobs:
-  deploy-test-direct:
-    runs-on: [self-hosted, linux, x64, collector-test]
-    permissions:
-      contents: read
-    
+  note:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout pushed revision
-        uses: actions/checkout@v6
-
-      - name: Write runtime env
-        shell: bash
-        run: |
-          cat > .env <<'EOF'
-          ${{ secrets.COLLECTOR_ENV_TEST }}
-          EOF
-
-      - name: Export env
-        shell: bash
-        run: |
-          grep -v '^[[:space:]]*#' .env | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
-
-      - name: Ensure docker network exists
-        run: |
-          docker network inspect collector-test-net >/dev/null 2>&1 || docker network create collector-test-net
-
-      - name: Check DB container
-        run: |
-          docker inspect rainbow-mariadb-test >/dev/null 2>&1
-
-      - name: Stop existing app container
-        run: |
-          docker rm -f collector-server-test || true
-
-      - name: Build image locally
-        run: |
-          docker build -t collector-server:test .
-
-      - name: Start app container
-        run: |
-          docker run -d \
-            --name collector-server-test \
-            --restart unless-stopped \
-            --network collector-test-net \
-            -p "${PORT}:${PORT}" \
-            --env-file .env \
-            collector-server:test
-
-      - name: Wait for healthz
-        shell: bash
-        run: |
-          for i in {1..30}; do
-            if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          docker logs collector-server-test || true
-          exit 1
+      - run: echo "dev deploy is handled by the test server systemd timer"
