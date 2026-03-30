@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   deploy-test-direct:
-    runs-on: [self-hostedm linux, x64, collector-test]
+    runs-on: [self-hosted, linux, x64, collector-test]
     permissions:
       contents: read
     
