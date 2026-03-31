@@ -4,12 +4,14 @@ on:
   workflow_dispatch:
   pull_request:
     branches:
+      #- main
       - dev
-      - main
+      - dev-prod
   push:
     branches:
+      #- main
       - dev
-      - main
+      - dev-prod
 
 jobs:
   smoke:
