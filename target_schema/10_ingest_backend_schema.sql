@@ -115,8 +115,7 @@ CREATE TABLE `tasks` (
   KEY `fk_tasks_session_id` (`session_id`),
   KEY `fk_tasks_step_id` (`step_id`),
   CONSTRAINT `fk_tasks_session_id` FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_tasks_step_id` FOREIGN KEY (`step_id`) REFERENCES `steps` (`id`),
-  UNIQUE KEY `uq_tasks_session_task_name` (`session_id`,`task_name`)
+  CONSTRAINT `fk_tasks_step_id` FOREIGN KEY (`step_id`) REFERENCES `steps` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `events` (
