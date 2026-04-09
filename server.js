@@ -78,10 +78,17 @@ function requireApiKey(req, res, next) {
 - pagehide/keepalive 류 요청에서 커스텀 헤더 전달이 불안정할 수 있기 때문입니다.
 - 보안보다 수집 누락 방지를 우선한 절충입니다.
 */
+
+// Tenant
+const TENANT_KEY_MAP = JSON.parse(process.env.TENANT_KEYS || '{}');
+
 function requireApiKey(req, res, next) {
   // 창 종료 시 api_key 쿼리 파라미터 사용 가능
   const k = req.get("x-api-key") || req.query.api_key; // 요청 헤더에서 x-api-key 헤더 값 또는 쿼리 파라미터에서 api_key 값 가져옴
-  if (!k || k !== process.env.API_KEY) return res.status(401).json({ error: "unauthorized" }); // API_KEY와 일치하지 않으면 401 오류 반환
+  // if (!k || k !== process.env.API_KEY) return res.status(401).json({ error: "unauthorized" }); // API_KEY와 일치하지 않으면 401 오류 반환
+  const valid = (k === process.env.API_KEY) ||
+                Object.prototype.hasOwnProperty.call(TENANT_KEY_MAP, k);
+  if (!k || !valid) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 app.use(async (req, res, next) => {
@@ -188,12 +195,16 @@ const betterUserId = (prev, next) => {
 };
 
 // multi-tenant (여러 조직이 하나의 시스템을 공유하도록 지원)
-const parseTenantId = (req, row) =>
-  SAFE(row?.AZ_tenant_id) ||
-  SAFE(req.get("x-az-tenant")) ||
-  SAFE(req.get("x-tenant-id")) ||
-  SAFE(req.get("x-tenant")) ||
-  null;
+// const parseTenantId = (req, row) =>
+//   SAFE(row?.AZ_tenant_id) ||
+//   SAFE(req.get("x-az-tenant")) ||
+//   SAFE(req.get("x-tenant-id")) ||
+//   SAFE(req.get("x-tenant")) ||
+//   null;
+const parseTenantId = (req, row) => {
+  const k = req.get("x-api-key") || req.query.api_key;
+  return TENANT_KEY_MAP[k] || null;
+};
 
 // 길이 클램프 & 정규화 유틸
 const MAXLEN = {
