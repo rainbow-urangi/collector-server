@@ -18,6 +18,11 @@ const cors = require("cors"); // 다른 도메인에서 이 서버에 접근할 
 const pino = require("pino"); // 빠른 로그 기록 라이브러리
 //const mariadb = require("mariadb"); // mariadb 모듈 로드
 const crypto = require("crypto"); // 암호화, 랜덤 값 생성 등을 하는 node 내장 라이브러리
+const {
+  applyIdentity,
+  upsertIdentitySeeds,
+  startIdentityAllocator,
+} = require("./src/identity");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
 
@@ -81,6 +86,10 @@ function requireApiKey(req, res, next) {
 
 // Tenant
 const TENANT_KEY_MAP = JSON.parse(process.env.TENANT_KEYS || '{}');
+const IDENTITY_HMAC_SECRET = process.env.IDENTITY_HMAC_SECRET || "";
+const IDENTITY_ALLOCATOR_INTERVAL_MS = Number(process.env.IDENTITY_ALLOCATOR_INTERVAL_MS || 3000);
+const IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT || 20);
+const IDENTITY_ALLOCATOR_BATCH_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_BATCH_LIMIT || 200);
 
 function requireApiKey(req, res, next) {
   // 창 종료 시 api_key 쿼리 파라미터 사용 가능
@@ -183,14 +192,21 @@ const pathOf = (u) => {
 // 유효한 사용자 ID인지 확인
 const isKnownUserId = (v) => {
   const s = SAFE(v); // SAFE 함수로 문자열 정리
-  return !!(s && s.toLowerCase() !== "unknown"); // s가 null 또는 undefined 이거나 "unknown"이 아니면 true 반환
+  if (!s || s.toLowerCase() === "unknown") return false;
+  if (/[\r\n\t]/.test(s)) return false;
+  if (/^\d{4}[-./]\d{2}[-./]\d{2}$/.test(s)) return false;
+  if (/^\d{4}[-./]\d{2}[-./]\d{2}\s*-\s*\d{4}[-./]\d{2}[-./]\d{2}$/.test(s)) return false;
+  return true;
+  //return !!(s && s.toLowerCase() !== "unknown"); // s가 null 또는 undefined 이거나 "unknown"이 아니면 true 반환
 };
 
 // user_id 보강: unknown 대신 새 값 사용
 const betterUserId = (prev, next) => {
   const p = SAFE(prev), n = SAFE(next); // prev: 이전 값, next: 새 값 모두 SAFE 함수로 정리
-  if (!n || n.toLowerCase() === "unknown") return p || null; // n이 null 또는 undefined 이거나 "unknown"이면 p 반환
-  if (!p || p.toLowerCase() === "unknown") return n; // p가 null 또는 undefined 이거나 "unknown"이면 n 반환
+  if (!isKnownUserId(n)) return isKnownUserId(p) ? p : null;
+  if (!isKnownUserId(p)) return n;
+  // if (!n || n.toLowerCase() === "unknown") return p || null; // n이 null 또는 undefined 이거나 "unknown"이면 p 반환
+  // if (!p || p.toLowerCase() === "unknown") return n; // p가 null 또는 undefined 이거나 "unknown"이면 n 반환
   return p; // p 반환
 };
 
@@ -304,7 +320,8 @@ function actorKeyOfRow(row) {
   const sid = SAFE(row?.AZ_session_page_id);
 
   // loginId가 있고 "unknown"이 아니면 키 생성 loginId
-  if (loginId && loginId.toLowerCase() !== "unknown") {
+  //if (loginId && loginId.toLowerCase() !== "unknown") {
+  if (isKnownUserId(loginId)) {
     return `login:${loginId}`;
   }
   // loginId가 없고 browserId가 있으면 키 생성
@@ -827,14 +844,16 @@ async function processBatch(rows, clientIp, tenantId) {
   if (!rows.length) return { inserted: 0, snapshots: 0 };
 
   // 0) 보강
-  const norm = rows.map((r) => enrichRow(r, clientIp, tenantId));
-
+  const norm = rows.map((r) =>
+    applyIdentity(enrichRow(r, clientIp, tenantId), IDENTITY_HMAC_SECRET)
+  );
   // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지)
   assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    await upsertIdentitySeeds(conn, norm, log);
 
     // 1) 세션 upsert (세션ID 있는 것만)
     const sessAgg = batchAggregateSessions(norm);
@@ -1379,8 +1398,17 @@ app.get("/healthz", (req, res) => res.json({ ok: true }));
 const port = Number(process.env.PORT || 8080);
 
 async function start() {
+  if (!IDENTITY_HMAC_SECRET) {
+    throw new Error("IDENTITY_HMAC_SECRET is required");
+  }
+
   const mariadb = await import("mariadb");
   pool = mariadb.createPool(dbConfig);
+  startIdentityAllocator(pool, log, {
+    intervalMs: IDENTITY_ALLOCATOR_INTERVAL_MS,
+    tenantScanLimit: IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT,
+    batchLimit: IDENTITY_ALLOCATOR_BATCH_LIMIT,
+  });
   app.listen(port, () => log.info(`direct ingest listening :${port}`));
 }
 
