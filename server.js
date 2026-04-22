@@ -850,7 +850,7 @@ async function processBatch(rows, clientIp, tenantId) {
   const norm = rows.map((r) =>
     applyIdentity(enrichRow(r, clientIp, tenantId), IDENTITY_HMAC_SECRET)
   );
-  // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지)
+  // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지) 
   assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
 
   const conn = await pool.getConnection();
