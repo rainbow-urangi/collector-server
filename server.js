@@ -21,6 +21,7 @@ const crypto = require("crypto"); // 암호화, 랜덤 값 생성 등을 하는 
 const {
   applyIdentity,
   upsertIdentitySeeds,
+  hydrateTenantUserLabels,
   startIdentityAllocator,
 } = require("./src/identity");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
@@ -313,6 +314,8 @@ function resolveEventTsMs(row, fallbackMs = Date.now()) {
 
 // 유저 행동 키 생성
 function actorKeyOfRow(row) {
+  const tenantUserLabel = SAFE(row?._tenant_user_label);
+  if (tenantUserLabel) return tenantUserLabel;  
   // AZ_login_id, AZ_session_browser_id, AZ_session_install_id, AZ_session_page_id 필드 추출 및 정리
   const loginId = SAFE(row?.AZ_login_id);
   const browserId = SAFE(row?.AZ_session_browser_id);
@@ -854,6 +857,11 @@ async function processBatch(rows, clientIp, tenantId) {
   try {
     await conn.beginTransaction();
     await upsertIdentitySeeds(conn, norm, log);
+
+    await hydrateTenantUserLabels(conn, norm, log);
+
+    // tenant_user_label 이 준비된 뒤 workflow key 생성
+    assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
 
     // 1) 세션 upsert (세션ID 있는 것만)
     const sessAgg = batchAggregateSessions(norm);
