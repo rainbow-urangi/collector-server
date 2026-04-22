@@ -21,7 +21,6 @@ const crypto = require("crypto"); // 암호화, 랜덤 값 생성 등을 하는 
 const {
   applyIdentity,
   upsertIdentitySeeds,
-  hydrateTenantUserLabels,
   startIdentityAllocator,
 } = require("./src/identity");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
@@ -857,11 +856,6 @@ async function processBatch(rows, clientIp, tenantId) {
   try {
     await conn.beginTransaction();
     await upsertIdentitySeeds(conn, norm, log);
-
-    await hydrateTenantUserLabels(conn, norm, log);
-
-    // tenant_user_label 이 준비된 뒤 workflow key 생성
-    assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
 
     // 1) 세션 upsert (세션ID 있는 것만)
     const sessAgg = batchAggregateSessions(norm);
