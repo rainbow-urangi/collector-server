@@ -1,10 +1,12 @@
 services:
   mariadb:
     image: mariadb:11.4
-    env_file:
-      - ./ci/test.env
     environment:
       TZ: ${TZ}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
     ports:
       - "${DB_PORT}:${DB_PORT}"
     volumes:
@@ -20,8 +22,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file:
-      - ./ci/test.env
+    environment:
+      TZ: ${TZ}
+      PORT: ${PORT}
+      TRUST_PROXY: ${TRUST_PROXY}
+      API_KEY: ${API_KEY}
+      DB_HOST: mariadb
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE: ${DB_DATABASE}
+      DB_CONN_LIMIT: ${DB_CONN_LIMIT}
+      TASK_NAME: ${TASK_NAME}
+      WORKFLOW_IDLE_MS: ${WORKFLOW_IDLE_MS}
+      API_PATH_MAX: ${API_PATH_MAX}
+      IDENTITY_HMAC_SECRET: ${IDENTITY_HMAC_SECRET}
     depends_on:
       mariadb:
         condition: service_healthy

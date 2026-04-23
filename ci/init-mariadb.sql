@@ -1,9 +1,5 @@
 CREATE DATABASE IF NOT EXISTS ingest_backend_db CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 
-CREATE USER IF NOT EXISTS 'backend_admin'@'%' IDENTIFIED BY 'Back@end#01!';
-GRANT SELECT, INSERT, UPDATE ON ingest_backend_db.* TO 'backend_admin'@'%';
-FLUSH PRIVILEGES;
-
 USE ingest_backend_db;
 
 DROP TABLE IF EXISTS `events`;
