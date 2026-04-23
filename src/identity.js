@@ -30,7 +30,7 @@ function hmacId(secret, scope, tenantId, value) {
   const raw = safe(value);
   if (!raw) return null;
 
-  return `u1_${crypto
+  return `${crypto
     .createHmac("sha256", secret)
     .update(`${scope}:${tenant}:${raw}`)
     .digest("hex")}`;
