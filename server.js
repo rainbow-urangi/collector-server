@@ -44,6 +44,42 @@ app.options("/ingest/batch", cors(corsOptions)); // 특정 경로에 대한 cors
 app.use(express.json({ limit: "32mb" })); // 요청 본문 크기 제한
 app.use(express.text({ type: ["text/plain", "application/json"], limit: "32mb" })); // 텍스트 본문 크기 제한
 
+const SNAPSHOT_WRITE_ENABLED = process.env.SNAPSHOT_WRITE_ENABLED === "true";
+const SNAPSHOT_SAVE_DOM_ONLY = process.env.SNAPSHOT_SAVE_DOM_ONLY === "true";
+const SNAPSHOT_API_BODY_MAX_BYTES = Number(process.env.SNAPSHOT_API_BODY_MAX_BYTES || 200000);
+
+function normalizeSnapshotJson(value) {
+  if (value === null || value === undefined) return null;
+
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      parsed = {
+        kind: "raw_text_snapshot",
+        version: 1,
+        body: value,
+      };
+    }
+  }
+
+  let json = JSON.stringify(parsed);
+  const bytes = Buffer.byteLength(json, "utf8");
+
+  if (bytes > SNAPSHOT_API_BODY_MAX_BYTES) {
+    json = JSON.stringify({
+      kind: "snapshot_truncated",
+      version: 1,
+      truncated: true,
+      original_bytes: bytes,
+      preview: json.slice(0, SNAPSHOT_API_BODY_MAX_BYTES),
+    });
+  }
+
+  return json;
+}
+
 // ───────────────────── DB Pool ─────────────────────
 let pool;
 const dbConfig = {
@@ -913,6 +949,7 @@ async function processBatch(rows, clientIp, tenantId) {
     const perTaskMin = new Map(),
       perTaskMax = new Map();
     let totalEvents = 0,
+      totalDuplicates = 0,
       totalSnaps = 0;
 
     for (const r of norm) {
@@ -1046,30 +1083,49 @@ async function processBatch(rows, clientIp, tenantId) {
       );
 
       const eventId = evtRes.insertId;
+      if (eventId) totalEvents += 1;
+      else totalDuplicates += 1;
 
-    // 스냅샷 저장 비활성화
-    /*
-      if (r._snap_dom_before || r._snap_dom_after || r._snap_api_body) {
-        let apiBody = r._snap_api_body;
-        if (typeof apiBody === "string") {
-          try {
-            apiBody = JSON.parse(apiBody);
-          } catch {
-            // keep string 
+      const hasApiSnapshot = r._snap_api_body !== null && r._snap_api_body !== undefined;
+      const hasDomSnapshot = r._snap_dom_before || r._snap_dom_after;
+
+      if (SNAPSHOT_WRITE_ENABLED && (hasApiSnapshot || (SNAPSHOT_SAVE_DOM_ONLY && hasDomSnapshot))) {
+        try {
+          const apiBodyJson = normalizeSnapshotJson(r._snap_api_body);
+
+          let dbEventId = eventId;
+          if (!dbEventId && r.AZ_event_id) {
+            const existing = await conn.query(
+              `SELECT id FROM events WHERE event_id = ? LIMIT 1`,
+              [r.AZ_event_id]
+            );
+            dbEventId = existing?.[0]?.id || null;
           }
+
+          if (dbEventId) {
+            await conn.query(
+              `INSERT INTO snapshots (event_id, dom_before, dom_after, api_response_body)
+              VALUES (?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                dom_before        = VALUES(dom_before),
+                dom_after         = VALUES(dom_after),
+                api_response_body = VALUES(api_response_body)`,
+              [
+                dbEventId,
+                r._snap_dom_before || null,
+                r._snap_dom_after || null,
+                apiBodyJson,
+              ]
+            );
+            totalSnaps++;
+          }
+        } catch (snapErr) {
+          log.warn({
+            err: snapErr?.message,
+            event_id: r.AZ_event_id,
+          }, "snapshot insert skipped");
         }
-        await conn.query(
-          `INSERT INTO snapshots (event_id, dom_before, dom_after, api_response_body)
-          VALUES (?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE
-            dom_before       = VALUES(dom_before),
-            dom_after        = VALUES(dom_after),
-            api_response_body= VALUES(api_response_body)`,
-          [ eventId, r._snap_dom_before || null, r._snap_dom_after || null, apiBody ?? null ]
-        );
-        totalSnaps++;
       }
-      */
 
       // 태스크 시간 범위 누적
       const tMin = perTaskMin.get(taskId);
@@ -1102,7 +1158,7 @@ async function processBatch(rows, clientIp, tenantId) {
     }
 
     await conn.commit();
-    return { inserted: totalEvents, snapshots: totalSnaps };
+    return { inserted: totalEvents, duplicates: totalDuplicates, snapshots: totalSnaps };
   } catch (e) {
     try { await conn.rollback(); } catch {}
     throw e;
@@ -1136,7 +1192,7 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
       try { requestBody = JSON.parse(requestBody); } catch(e) {}
     }
 
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    const rows = Array.isArray(requestBody?.rows) ? requestBody.rows : null;
     if (!rows?.length) return res.status(400).json({ error: "empty_rows" });
     
     // 요청자 IP → 세션 ip_address 보강
@@ -1246,7 +1302,9 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
     const result = await processBatch(filled, clientIp, null);
     res.json({
       ok: true,
+      received_rows: rows.length,
       inserted_events: result.inserted,
+      duplicate_events: result.duplicates,
       inserted_snapshots: result.snapshots,
     });
   } catch (e) {

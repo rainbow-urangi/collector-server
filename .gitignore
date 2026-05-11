@@ -2,6 +2,16 @@
 .env
 .env.*
 !.env.example
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Local CI / compose overrides
+ci/*.local.env
+ci/*.secret.env
+docker-compose.override.yml
+compose.override.yml
 
 # Dependencies
 node_modules/
@@ -21,12 +31,16 @@ pnpm-debug.log*
 coverage/
 tmp/
 temp/
+*.tmp
+*.bak
 
 # Editor / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
 
 
 target_schema/
