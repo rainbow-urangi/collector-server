@@ -1168,6 +1168,28 @@ async function processBatch(rows, clientIp, tenantId) {
 }
 
 // ───────────────────── 라우트 ─────────────────────
+app.get("/collector/runtime-config", requireApiKey, (req, res) => {
+  res.json({
+    schema_version: 1,
+    version: process.env.COLLECTOR_RUNTIME_CONFIG_VERSION || "prod-runtime-default",
+    fetched_at: new Date().toISOString(),
+    ttl_ms: Number(process.env.COLLECTOR_RUNTIME_CONFIG_TTL_MS || 300000),
+    modules: {
+      dom_events: { enabled: true },
+      api_hooks: { enabled: true },
+      snapshots: { enabled: true },
+      grid_adapters: { enabled: true },
+      workflow_rules: { enabled: true }
+    },
+    event_types: {},
+    selector_packs: {},
+    workflow_rules: [],
+    privacy: {
+      remote_code_execution: false
+    }
+  });
+});
+
 // 확장 SW 호출 바디: { reason, rows: [ AZ_*... (옵션) snapshot:{} ], ts }
 /*
 CHANGE NOTE: code_after 의 ingest route 는 JSON body 기준만 전제했습니다.
