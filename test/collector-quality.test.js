@@ -57,12 +57,14 @@ test("annotates missing core fields without dropping the row", () => {
   assert.equal(row.AZ_event_time, "2026-06-26 01:02:03.004");
   assert.match(row.AZ_session_page_id, /^server-session-/);
   assert.equal(row.AZ_event_action, "collector_diagnostic");
+  assert.match(row.AZ_login_id, /^server-actor:server-session-/);
   assert.equal(row.AZ_url, "about:blank");
   assert.equal(row.AZ_locators_json.analysis.existing_signal, "kept");
   assert.deepEqual(row.AZ_locators_json.analysis.server_quality_guard.flags, [
     "missing_event_id",
     "missing_event_time",
     "missing_page_session_id",
+    "missing_login_id",
     "missing_event_action",
     "missing_page_url",
     "missing_runtime_config_version",
@@ -86,6 +88,7 @@ test("preserves client runtime version and flags oversize API bodies", () => {
       AZ_event_action: "fetch_response",
       AZ_url: "https://example.com",
       AZ_session_page_id: "page-1",
+      AZ_login_id: "user-1",
       AZ_api_response_body: "123456",
       AZ_locators_json: JSON.stringify({
         analysis: {

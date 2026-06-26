@@ -325,6 +325,12 @@ function applyServerQualityGuard(rows, {
       mark("missing_page_session_id");
     }
 
+    if (!row.AZ_login_id) {
+      row.AZ_login_id = `server-actor:${row.AZ_session_page_id}`;
+      generatedFields.push("AZ_login_id");
+      mark("missing_login_id");
+    }
+
     if (!row.AZ_event_action) {
       row.AZ_event_action = "collector_diagnostic";
       generatedFields.push("AZ_event_action");
