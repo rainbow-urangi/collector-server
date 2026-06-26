@@ -221,6 +221,8 @@ const USER_RELEVANT_ACTIONS = new Set([
   "pointerdown",
   "pointerup",
   "page_close",
+  "popup_open",
+  "popup_close",
 ]);
 
 // 오류 키워드 정규식 정의
@@ -729,6 +731,9 @@ function toEventTuple(r, taskId) {
   else if (r.AZ_event_action === 'visibility_change') interaction_type = 'visibility_change';
   else if (r.AZ_event_action === 'page_close') interaction_type = 'page_close';
   else if (r.AZ_event_action === 'page_view') interaction_type = 'page_view';
+  else if (r.AZ_event_action === "popup_open") interaction_type = "popup_open";
+  else if (r.AZ_event_action === "popup_close") interaction_type = "popup_close";
+  else if (r.AZ_event_action === "ui_outcome") interaction_type = "ui_outcome";
   // 입력 데이터 설정 (이벤트, 메뉴, 상태 타입이 아닐 경우 null)
   const input_data = r.AZ_data ?? null;
   // const input_data = ["event", "menu", "state"].includes(r.AZ_element_type || "")
