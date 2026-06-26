@@ -23,6 +23,18 @@ const {
   upsertIdentitySeeds,
   startIdentityAllocator,
 } = require("./src/identity");
+const {
+  normalizeEnvironment,
+  readKeyMapFromEnvironment,
+  readOptionalDbConfig,
+  resolveCollectorIdentity,
+  validateDatabaseSeparation,
+  validateKeySeparation,
+} = require("./src/collectorRouting");
+const {
+  applyServerQualityGuard,
+  buildQualityRuntimeConfig,
+} = require("./src/collectorQuality");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
 
@@ -82,6 +94,10 @@ function normalizeSnapshotJson(value) {
 
 // ───────────────────── DB Pool ─────────────────────
 let pool;
+const databasePools = new Map();
+const PRIMARY_DB_ENVIRONMENT = normalizeEnvironment(
+  process.env.COLLECTOR_DB_ENV || "production"
+);
 const dbConfig = {
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 3306),
@@ -91,6 +107,14 @@ const dbConfig = {
   connectionLimit: Number(process.env.DB_CONN_LIMIT || 10),
   connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 };
+const SECONDARY_DB_ENVIRONMENT =
+  PRIMARY_DB_ENVIRONMENT === "production" ? "test" : "production";
+const secondaryDbConfig = readOptionalDbConfig(
+  SECONDARY_DB_ENVIRONMENT,
+  SECONDARY_DB_ENVIRONMENT === "production" ? "PROD_" : "TEST_",
+  Number(process.env.DB_CONN_LIMIT || 10)
+);
+validateDatabaseSeparation(dbConfig, secondaryDbConfig);
 
 // actor 별 워크플로우 상태 캐시
 const actorCache = new Map();
@@ -121,7 +145,20 @@ function requireApiKey(req, res, next) {
 */
 
 // Tenant
-const TENANT_KEY_MAP = JSON.parse(process.env.TENANT_KEYS || '{}');
+const TENANT_KEY_MAP = readKeyMapFromEnvironment("TENANT_KEYS", "tenant_keys");
+const TEST_TENANT_KEY_MAP = readKeyMapFromEnvironment(
+  "TEST_TENANT_KEYS",
+  "test_tenant_keys"
+);
+const collectorKeyOptions = {
+  productionApiKey: process.env.API_KEY || "",
+  productionTenantId: process.env.PRODUCTION_TENANT_ID || null,
+  productionTenantKeys: TENANT_KEY_MAP,
+  testApiKey: process.env.TEST_API_KEY || "",
+  testTenantId: process.env.TEST_TENANT_ID || "test_company",
+  testTenantKeys: TEST_TENANT_KEY_MAP,
+};
+validateKeySeparation(collectorKeyOptions);
 const IDENTITY_HMAC_SECRET = process.env.IDENTITY_HMAC_SECRET || "";
 const IDENTITY_ALLOCATOR_INTERVAL_MS = Number(process.env.IDENTITY_ALLOCATOR_INTERVAL_MS || 3000);
 const IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT || 20);
@@ -130,10 +167,12 @@ const IDENTITY_ALLOCATOR_BATCH_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_BAT
 function requireApiKey(req, res, next) {
   // 창 종료 시 api_key 쿼리 파라미터 사용 가능
   const k = req.get("x-api-key") || req.query.api_key; // 요청 헤더에서 x-api-key 헤더 값 또는 쿼리 파라미터에서 api_key 값 가져옴
-  // if (!k || k !== process.env.API_KEY) return res.status(401).json({ error: "unauthorized" }); // API_KEY와 일치하지 않으면 401 오류 반환
-  const valid = (k === process.env.API_KEY) ||
-                Object.prototype.hasOwnProperty.call(TENANT_KEY_MAP, k);
-  if (!k || !valid) return res.status(401).json({ error: "unauthorized" });
+  const identity = resolveCollectorIdentity(k, collectorKeyOptions);
+  if (!identity) return res.status(401).json({ error: "unauthorized" });
+  req.collectorContext = {
+    ...identity,
+    pool: databasePools.get(identity.environment) || null,
+  };
   next();
 }
 app.use(async (req, res, next) => {
@@ -254,8 +293,7 @@ const betterUserId = (prev, next) => {
 //   SAFE(req.get("x-tenant")) ||
 //   null;
 const parseTenantId = (req, row) => {
-  const k = req.get("x-api-key") || req.query.api_key;
-  return TENANT_KEY_MAP[k] || null;
+  return req.collectorContext?.tenantId || null;
 };
 
 // 길이 클램프 & 정규화 유틸
@@ -431,7 +469,7 @@ function setActorWorkflowHints(row, actorKey, workflowIndex, eventTsMs, step_dur
   row.AZ_locators_json = locObj;
 }
 // actor 별 workflow index 할당
-function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
+function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS, cacheNamespace = "production") {
   try {
     // 각 row를 item 구조로 변환 
     // (r: row, seq: 순서, eventTsMs: 이벤트 시간, actorKey: 유저 행동 키, workflowIndex: 초기값 1)
@@ -459,7 +497,8 @@ function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
       bucket.sort((a, b) => a.eventTsMs - b.eventTsMs || a.seq - b.seq);
 
       // 캐시에서 워크플로우 상태 조회
-      const cached = actorCache.get(bucket[0].actorKey);
+      const actorCacheKey = `${cacheNamespace}:${bucket[0].actorKey}`;
+      const cached = actorCache.get(actorCacheKey);
       // workflow index 초기값 1
       let workflowIndex = cached?.workflowIndex ?? 1;
       // 현재 workflow에 이벤트가 하나라도 들어갔는지 확인
@@ -525,7 +564,7 @@ function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
         }
       }
       // 현재 배치 결과를 캐시에 저장
-      actorCache.set(bucket[0].actorKey, {
+      actorCache.set(actorCacheKey, {
         lastRelevantTs,
         workflowIndex,
         accessedAt: Date.now(),
@@ -878,17 +917,24 @@ async function resolveOrCreateSession(conn, r) {
 // 이 호출은 "기존 tasks/session 적재 로직은 유지"한 채,
 // 추가로 workflow 힌트만 side-channel로 심는 절충안입니다.
 // 즉 DB의 주 적재 구조를 갈아엎지 않고, 후속 프로세스 분석용 열(workflow_key/index)만 확장합니다.
-async function processBatch(rows, clientIp, tenantId) {
+async function processBatch(
+  rows,
+  clientIp,
+  tenantId,
+  targetPool = pool,
+  cacheNamespace = PRIMARY_DB_ENVIRONMENT
+) {
   if (!rows.length) return { inserted: 0, snapshots: 0 };
+  if (!targetPool) throw new Error(`collector_database_unavailable:${cacheNamespace}`);
 
   // 0) 보강
   const norm = rows.map((r) =>
     applyIdentity(enrichRow(r, clientIp, tenantId), IDENTITY_HMAC_SECRET)
   );
   // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지) 
-  assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
+  assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS, cacheNamespace);
 
-  const conn = await pool.getConnection();
+  const conn = await targetPool.getConnection();
   try {
     await conn.beginTransaction();
     await upsertIdentitySeeds(conn, norm, log);
@@ -1169,25 +1215,9 @@ async function processBatch(rows, clientIp, tenantId) {
 
 // ───────────────────── 라우트 ─────────────────────
 app.get("/collector/runtime-config", requireApiKey, (req, res) => {
-  res.json({
-    schema_version: 1,
-    version: process.env.COLLECTOR_RUNTIME_CONFIG_VERSION || "prod-runtime-default",
-    fetched_at: new Date().toISOString(),
-    ttl_ms: Number(process.env.COLLECTOR_RUNTIME_CONFIG_TTL_MS || 300000),
-    modules: {
-      dom_events: { enabled: true },
-      api_hooks: { enabled: true },
-      snapshots: { enabled: true },
-      grid_adapters: { enabled: true },
-      workflow_rules: { enabled: true }
-    },
-    event_types: {},
-    selector_packs: {},
-    workflow_rules: [],
-    privacy: {
-      remote_code_execution: false
-    }
-  });
+  res.json(buildQualityRuntimeConfig({
+    environment: req.collectorContext?.environment || PRIMARY_DB_ENVIRONMENT,
+  }));
 });
 
 // 확장 SW 호출 바디: { reason, rows: [ AZ_*... (옵션) snapshot:{} ], ts }
@@ -1208,6 +1238,14 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
 */
 app.post("/ingest/batch", requireApiKey, async (req, res) => {
   try {
+    const collectorContext = req.collectorContext;
+    if (!collectorContext?.pool) {
+      return res.status(503).json({
+        error: "collector_database_unavailable",
+        collector_environment: collectorContext?.environment || null,
+      });
+    }
+
     // 창 종료 시 텍스트 본문 처리
     let requestBody = req.body;
     if (typeof requestBody === 'string') {
@@ -1320,14 +1358,29 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
       o._tenant_id = tenantIdPerRow(r);
       return o;
     });
+    const runtimeConfig = buildQualityRuntimeConfig({
+      environment: collectorContext.environment,
+    });
+    const guarded = applyServerQualityGuard(filled, {
+      config: runtimeConfig,
+      environment: collectorContext.environment,
+    });
 
-    const result = await processBatch(filled, clientIp, null);
+    const result = await processBatch(
+      guarded.rows,
+      clientIp,
+      collectorContext.tenantId,
+      collectorContext.pool,
+      collectorContext.environment
+    );
     res.json({
       ok: true,
+      collector_environment: collectorContext.environment,
       received_rows: rows.length,
       inserted_events: result.inserted,
       duplicate_events: result.duplicates,
       inserted_snapshots: result.snapshots,
+      quality: guarded.summary,
     });
   } catch (e) {
     log.error(e);
@@ -1486,11 +1539,21 @@ async function start() {
 
   const mariadb = await import("mariadb");
   pool = mariadb.createPool(dbConfig);
+  databasePools.set(PRIMARY_DB_ENVIRONMENT, pool);
   startIdentityAllocator(pool, log, {
     intervalMs: IDENTITY_ALLOCATOR_INTERVAL_MS,
     tenantScanLimit: IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT,
     batchLimit: IDENTITY_ALLOCATOR_BATCH_LIMIT,
   });
+  if (secondaryDbConfig) {
+    const secondaryPool = mariadb.createPool(secondaryDbConfig);
+    databasePools.set(SECONDARY_DB_ENVIRONMENT, secondaryPool);
+    startIdentityAllocator(secondaryPool, log, {
+      intervalMs: IDENTITY_ALLOCATOR_INTERVAL_MS,
+      tenantScanLimit: IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT,
+      batchLimit: IDENTITY_ALLOCATOR_BATCH_LIMIT,
+    });
+  }
   app.listen(port, () => log.info(`direct ingest listening :${port}`));
 }
 

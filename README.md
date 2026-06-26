@@ -17,6 +17,8 @@ Rainbow Recorder에서 전송한 batched 이벤트를 받아 MariaDB에 저장�
 * MariaDB 기반 직접 적재
 * `text/plain` / JSON body 지원
 * `x-api-key` header 및 `api_key` query 지원
+* 서버 설정형 runtime config (`GET /collector/runtime-config`)
+* 서버 측 데이터 품질 가드 및 품질 메타 주입
 * Docker 기반 smoke CI 지원
 
 ---
@@ -67,6 +69,9 @@ npm install
 PORT=8080
 TRUST_PROXY=0
 API_KEY=local-dev-test-key-12345
+TEST_API_KEY=test_key
+TEST_TENANT_ID=test_company
+COLLECTOR_DB_ENV=production
 
 DB_HOST=127.0.0.1
 DB_PORT=3306
@@ -75,24 +80,60 @@ DB_PASSWORD=Back@end#01!
 DB_DATABASE=ingest_backend_db
 DB_CONN_LIMIT=10
 
+TEST_DB_HOST=127.0.0.1
+TEST_DB_PORT=3307
+TEST_DB_USER=backend_admin
+TEST_DB_PASSWORD=replace-in-local-env-only
+TEST_DB_DATABASE=ingest_backend_db
+TEST_DB_CONN_LIMIT=5
+
 TASK_NAME=SessionFlow
 WORKFLOW_IDLE_MS=120000
 API_PATH_MAX=1024
+COLLECTOR_RUNTIME_CONFIG_VERSION=quality-runtime-v1
+COLLECTOR_RUNTIME_CONFIG_TTL_MS=300000
+COLLECTOR_MAX_TEXT_BYTES=60000
+COLLECTOR_MAX_RESPONSE_BODY_BYTES=200000
 ```
 
 주요 설정:
 
 * `API_KEY`: ingest 인증 키
+* `TEST_API_KEY`: 테스트 DB로만 저장할 테스트 인증 키
+* `TENANT_KEYS`: 운영 키와 운영 테넌트의 JSON 매핑
+* `TEST_TENANT_KEYS`: 테스트 키와 테스트 테넌트의 JSON 매핑
+* `COLLECTOR_DB_ENV`: 기존 `DB_*`가 가리키는 환경 (`production` 기본값 또는 `test`)
 * `DB_*`: MariaDB 연결 정보
+* `TEST_DB_*`: 기본 환경이 운영일 때 사용할 테스트 MariaDB 연결 정보
+* `PROD_DB_*`: 기본 환경이 테스트일 때 사용할 운영 MariaDB 연결 정보
 * `DB_DATABASE`: 대상 데이터베이스 이름
 * `TASK_NAME`: 기본 task 이름
 * `WORKFLOW_IDLE_MS`: workflow 분리 기준 시간(ms)
+* `COLLECTOR_RUNTIME_CONFIG_VERSION`: extension이 이벤트에 남길 서버 설정 버전
+* `COLLECTOR_RUNTIME_CONFIG_TTL_MS`: extension runtime config 캐시 시간(ms)
+* `COLLECTOR_RUNTIME_MODULES_JSON`: 서버에서 내려줄 모듈 설정 JSON
+* `COLLECTOR_RUNTIME_PRIVACY_JSON`: 마스킹/제외/byte 제한 정책 JSON
+* `COLLECTOR_RUNTIME_QUALITY_JSON`: 품질 가드 정책 JSON
+* `COLLECTOR_RUNTIME_WORKFLOW_RULES_JSON`: workflow rule 배열 JSON
+* `COLLECTOR_MAX_TEXT_BYTES`: 텍스트 필드 품질 플래그 기준 byte
+* `COLLECTOR_MAX_RESPONSE_BODY_BYTES`: API 응답 본문 품질 플래그 기준 byte
+
+`content.js`와 `background.js`를 변경하지 않는 운영에서는 서버가 JS 코드를 내려보내지
+않고 JSON 설정만 배포합니다. 수집 방식 자체는 extension에 내장된 범위 안에서 동작하며,
+서버는 `modules`, `workflow_rules`, `privacy`, `quality` 정책을 내려주고 ingest 단계에서
+누락/보정/과대 payload 여부를 `locators_json.analysis.server_quality_guard`에 추가합니다.
+이 값은 기존 raw 필드를 덮어쓰지 않는 분석용 메타데이터입니다.
 
 ---
 
 ## 🗄 Database
 
 이 서버는 `ingest_backend_db` 호환 스키마를 기준으로 동작합니다.
+
+API 키와 DB 환경은 서버에서만 매핑합니다. `test_key`를 `TEST_API_KEY` 또는
+`TEST_TENANT_KEYS`에 등록하면 테스트 DB로만 저장되며, 운영 키는 기존
+`API_KEY` 또는 `TENANT_KEYS`를 통해 운영 DB로 저장됩니다. 같은 키를 양쪽
+환경에 등록하면 서버가 시작되지 않습니다.
 
 주요 테이블:
 

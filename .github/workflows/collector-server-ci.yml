@@ -21,6 +21,7 @@ jobs:
       PORT: "8080"
       TRUST_PROXY: "0"
       API_KEY: ${{ secrets.CI_API_KEY }}
+      TEST_API_KEY: "ci-test-key"
       DB_HOST: mariadb
       DB_PORT: "3306"
       DB_USER: backend_admin
@@ -65,15 +66,31 @@ jobs:
           curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest/batch?api_key=${API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{"rows":[{"AZ_event_id":"ci-smoke-1","AZ_event_time":"2026-03-24 17:30:00.000000","AZ_event_action":"page_view","AZ_element_type":"page","AZ_url":"https://example.com/dashboard","AZ_page_title":"CI Smoke","AZ_session_page_id":"ci-session-1","AZ_session_browser_id":"ci-browser-1","AZ_login_id":"ci-user-1"}]}'
+          curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest/batch?api_key=${TEST_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"rows":[{"AZ_event_id":"ci-test-smoke-1","AZ_event_time":"2026-03-24 17:31:00.000000","AZ_event_action":"page_view","AZ_element_type":"page","AZ_url":"https://example.com/test-dashboard","AZ_page_title":"CI Test Smoke","AZ_session_page_id":"ci-test-session-1","AZ_session_browser_id":"ci-test-browser-1","AZ_login_id":"ci-test-user-1"}]}'
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PORT}/ingest/batch?api_key=unknown-key" \
+            -H "Content-Type: application/json" \
+            -d '{"rows":[{"AZ_event_id":"ci-unknown-1"}]}')" = "401"
 
       - name: Verify DB insert
         run: |
           EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1';")
+          PROD_TEST_EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-test-smoke-1';")
+          TEST_EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb-test mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-test-smoke-1';")
+          TEST_PROD_EVENT_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb-test mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1';")
           SESSION_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM sessions WHERE id='ci-session-1';")
           TASK_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM tasks WHERE session_id='ci-session-1';")
+          QUALITY_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-smoke-1' AND locators_json LIKE '%server_quality_guard%';")
+          TEST_QUALITY_COUNT=$(docker compose --project-directory . -f ci/compose.smoke.yml exec -T mariadb-test mariadb -N -u"$DB_USER" -p"$DB_PASSWORD" "$DB_DATABASE" -e "SELECT COUNT(*) FROM events WHERE event_id='ci-test-smoke-1' AND locators_json LIKE '%server_quality_guard%';")
           test "$EVENT_COUNT" = "1"
+          test "$PROD_TEST_EVENT_COUNT" = "0"
+          test "$TEST_EVENT_COUNT" = "1"
+          test "$TEST_PROD_EVENT_COUNT" = "0"
           test "$SESSION_COUNT" = "1"
           test "$TASK_COUNT" = "1"
+          test "$QUALITY_COUNT" = "1"
+          test "$TEST_QUALITY_COUNT" = "1"
 
       - name: Dump logs
         if: always()
