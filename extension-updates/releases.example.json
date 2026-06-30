@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "default_extension": "rainbow-collector",
+  "default_channel": "stable",
+  "extensions": {
+    "rainbow-collector": {
+      "extension_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "channels": {
+        "stable": {
+          "version": "1.0.0",
+          "crx_path": "rainbow-collector-1.0.0.crx"
+        },
+        "beta": {
+          "version": "1.1.0.1",
+          "crx_path": "rainbow-collector-1.1.0.1.crx"
+        }
+      },
+      "customers": {
+        "customer-a": {
+          "stable": {
+            "version": "1.0.1",
+            "crx_path": "rainbow-collector-1.0.1.crx"
+          }
+        }
+      }
+    }
+  }
+}

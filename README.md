@@ -18,6 +18,7 @@ Rainbow Recorder에서 전송한 batched 이벤트를 받아 MariaDB에 저장�
 * `text/plain` / JSON body 지원
 * `x-api-key` header 및 `api_key` query 지원
 * 서버 설정형 runtime config (`GET /collector/runtime-config`)
+* 자체 호스팅 CRX 업데이트 manifest (`GET /extension/update/:customer/:channel/updates.xml`)
 * 서버 측 데이터 품질 가드 및 품질 메타 주입
 * Docker 기반 smoke CI 지원
 
@@ -117,12 +118,59 @@ COLLECTOR_MAX_RESPONSE_BODY_BYTES=200000
 * `COLLECTOR_RUNTIME_WORKFLOW_RULES_JSON`: workflow rule 배열 JSON
 * `COLLECTOR_MAX_TEXT_BYTES`: 텍스트 필드 품질 플래그 기준 byte
 * `COLLECTOR_MAX_RESPONSE_BODY_BYTES`: API 응답 본문 품질 플래그 기준 byte
+* `COLLECTOR_EXTENSION_RELEASES_PATH`: CRX 업데이트 release catalog 경로
+* `COLLECTOR_EXTENSION_CRX_DIR`: CRX 파일 저장 디렉터리
+* `COLLECTOR_EXTENSION_UPDATE_BASE_URL`: updates.xml이 반환할 CRX 다운로드 base URL
 
 `content.js`와 `background.js`를 변경하지 않는 운영에서는 서버가 JS 코드를 내려보내지
 않고 JSON 설정만 배포합니다. 수집 방식 자체는 extension에 내장된 범위 안에서 동작하며,
 서버는 `modules`, `workflow_rules`, `privacy`, `quality` 정책을 내려주고 ingest 단계에서
 누락/보정/과대 payload 여부를 `locators_json.analysis.server_quality_guard`에 추가합니다.
 이 값은 기존 raw 필드를 덮어쓰지 않는 분석용 메타데이터입니다.
+
+### Extension CRX Auto Update
+
+Chrome Enterprise 정책으로 설치된 사내 배포용 extension은 서버의 update manifest를 통해
+자동 업데이트할 수 있습니다. 서버가 사용자 PC로 직접 push하는 방식이 아니라 Chrome이
+`updates.xml`을 주기적으로 pull하고, 더 높은 버전의 CRX를 발견하면 다운로드합니다.
+
+로컬 패키징 예시:
+
+```bash
+npm run package:extension
+```
+
+주요 산출물:
+
+```text
+extension-updates/
+├── releases.json
+├── updates.xml
+├── metadata.json
+├── extension-install-forcelist.json
+├── extension-settings.policy.json
+├── crx/
+│   └── rainbow-collector-<version>.crx
+└── private/
+    └── rainbow-collector.pem
+```
+
+`private/*.pem`은 extension ID를 결정하는 서명키이므로 Git에 올리면 안 됩니다.
+운영에서는 Secret Manager, HSM, 오프라인 서명 저장소 중 하나로 관리해야 합니다.
+
+업데이트 라우트:
+
+```text
+GET /extension/update/:customer/:channel/updates.xml
+GET /extension/update/:channel/updates.xml
+GET /extension/crx/:file
+GET /extension/update/healthz
+```
+
+Enterprise 정책 예시는 패키징 후 `extension-settings.policy.json`과
+`extension-install-forcelist.json`에 생성됩니다. 권장 방식은 `ExtensionSettings`에서
+`installation_mode=force_installed`, `update_url`, `override_update_url=true`를 지정하는
+방식입니다.
 
 ---
 

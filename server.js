@@ -35,6 +35,9 @@ const {
   applyServerQualityGuard,
   buildQualityRuntimeConfig,
 } = require("./src/collectorQuality");
+const {
+  registerExtensionUpdateRoutes,
+} = require("./src/extensionUpdate");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
 
@@ -1219,6 +1222,8 @@ async function processBatch(
 }
 
 // ───────────────────── 라우트 ─────────────────────
+registerExtensionUpdateRoutes(app);
+
 app.get("/collector/runtime-config", requireApiKey, (req, res) => {
   res.json(buildQualityRuntimeConfig({
     environment: req.collectorContext?.environment || PRIMARY_DB_ENVIRONMENT,

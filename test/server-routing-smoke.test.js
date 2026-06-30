@@ -2,7 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
@@ -166,4 +168,48 @@ test("selects the configured test pool without changing production routing", asy
     });
     assert.equal(productionResponse.status, 400);
   });
+});
+
+test("serves self-hosted extension update XML and CRX artifacts", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "collector-update-route-"));
+  const crxDir = path.join(tempDir, "crx");
+  const crxFile = "rainbow-collector-9.9.9.crx";
+  const releasesPath = path.join(tempDir, "releases.json");
+  fs.mkdirSync(crxDir, { recursive: true });
+  fs.writeFileSync(path.join(crxDir, crxFile), "fake-crx");
+  fs.writeFileSync(releasesPath, JSON.stringify({
+    default_extension: "rainbow-collector",
+    extensions: {
+      "rainbow-collector": {
+        extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        channels: {
+          stable: {
+            version: "9.9.9",
+            crx_path: crxFile,
+          },
+        },
+      },
+    },
+  }));
+
+  try {
+    await withServer({
+      COLLECTOR_EXTENSION_RELEASES_PATH: releasesPath,
+      COLLECTOR_EXTENSION_CRX_DIR: crxDir,
+      COLLECTOR_EXTENSION_UPDATE_BASE_URL: "https://updates.example.com",
+    }, async (port) => {
+      const xmlResponse = await fetch(`http://127.0.0.1:${port}/extension/update/default/stable/updates.xml`);
+      const xml = await xmlResponse.text();
+      assert.equal(xmlResponse.status, 200);
+      assert.match(xml, /appid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/);
+      assert.match(xml, /codebase="https:\/\/updates\.example\.com\/extension\/crx\/rainbow-collector-9\.9\.9\.crx"/);
+
+      const crxResponse = await fetch(`http://127.0.0.1:${port}/extension/crx/${crxFile}`);
+      assert.equal(crxResponse.status, 200);
+      assert.equal(crxResponse.headers.get("content-type"), "application/x-chrome-extension");
+      assert.equal(await crxResponse.text(), "fake-crx");
+    });
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });

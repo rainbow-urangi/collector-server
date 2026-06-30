@@ -5,6 +5,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "package:extension": "node tools/package-extension-crx.mjs",
+    "test:extension-update-shape": "node tools/verify-extension-update-shape.mjs",
     "test": "node --test"
   },
   "dependencies": {
