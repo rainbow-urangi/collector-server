@@ -2,21 +2,21 @@
   "schema_version": 1,
   "default_extension": "rainbow-collector",
   "default_channel": "stable",
-  "generated_at": "2026-06-30T01:40:18.577Z",
+  "generated_at": "2026-07-01T01:48:06.467Z",
   "extensions": {
     "rainbow-collector": {
       "extension_id": "donajhjhepkjmmcfincihhdokmmaaklc",
       "channels": {
         "stable": {
-          "version": "0.1.21",
-          "crx_path": "rainbow-collector-0.1.21.crx"
+          "version": "0.1.22",
+          "crx_path": "rainbow-collector-0.1.22.crx"
         }
       },
       "customers": {
         "default": {
           "stable": {
-            "version": "0.1.21",
-            "crx_path": "rainbow-collector-0.1.21.crx"
+            "version": "0.1.22",
+            "crx_path": "rainbow-collector-0.1.22.crx"
           }
         }
       }
