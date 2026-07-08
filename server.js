@@ -121,12 +121,19 @@ validateDatabaseSeparation(dbConfig, secondaryDbConfig);
 
 // actor 별 워크플로우 상태 캐시
 const actorCache = new Map();
+const causalChainCache = new Map();
+const eventCausalColumnSupportCache = new Map();
+const CAUSAL_CHAIN_TTL_MS = Number(process.env.CAUSAL_CHAIN_TTL_MS || 5000);
 
 // 캐시 메모리 정리 스케줄러
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const [key, val] of actorCache) {
     if (val.accessedAt < cutoff) actorCache.delete(key);
+  }
+  const causalCutoff = Date.now() - Math.max(CAUSAL_CHAIN_TTL_MS * 4, 60000);
+  for (const [key, val] of causalChainCache) {
+    if ((val.accessedAt || 0) < causalCutoff) causalChainCache.delete(key);
   }
 }, 60 * 60 * 1000);
 
@@ -472,6 +479,179 @@ function setActorWorkflowHints(row, actorKey, workflowIndex, eventTsMs, step_dur
 
   // 최종 객체를 row.AZ_locators_json에 삽입
   row.AZ_locators_json = locObj;
+}
+
+function limitedSafe(value, maxLen = 128) {
+  const s = SAFE(value);
+  if (!s) return null;
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+}
+
+function firstSafe(...values) {
+  for (const value of values) {
+    const s = SAFE(value);
+    if (s) return s;
+  }
+  return null;
+}
+
+function normalizeEventId(value) {
+  return limitedSafe(value, 64);
+}
+
+function relationContextFromLocators(locators) {
+  if (!locators || typeof locators !== "object" || Array.isArray(locators)) return {};
+  const raw = locators.raw_payload && typeof locators.raw_payload === "object" ? locators.raw_payload : {};
+  const legacy = raw.legacy && typeof raw.legacy === "object" ? raw.legacy : {};
+  const relation =
+    locators.relation_context ||
+    raw.relation_context ||
+    legacy.relation_context ||
+    {};
+  const eventContext =
+    locators.event_context ||
+    raw.event_context ||
+    legacy.event_context ||
+    {};
+  const analysis =
+    locators.analysis && typeof locators.analysis === "object" && !Array.isArray(locators.analysis)
+      ? locators.analysis
+      : {};
+
+  return {
+    interactionId: limitedSafe(
+      firstSafe(analysis.interaction_id, eventContext.interaction_id, raw.interaction_id),
+      128
+    ),
+    relatedInteractionId: limitedSafe(
+      firstSafe(
+        relation.related_interaction_id,
+        raw.related_interaction_id,
+        eventContext.related_interaction_id
+      ),
+      128
+    ),
+    relatedEventId: normalizeEventId(
+      firstSafe(relation.related_event_id, raw.related_event_id, eventContext.related_event_id)
+    ),
+    relatedAction: limitedSafe(
+      firstSafe(relation.related_action, raw.related_action, eventContext.related_action),
+      64
+    ),
+    relatedStrategy: limitedSafe(
+      firstSafe(relation.related_strategy, raw.related_strategy, eventContext.related_strategy),
+      64
+    ),
+    causalChainId: limitedSafe(
+      firstSafe(analysis.causal_chain_id, raw.causal_chain_id, relation.causal_chain_id),
+      128
+    ),
+    causeEventId: normalizeEventId(
+      firstSafe(analysis.cause_event_id, raw.cause_event_id, relation.cause_event_id)
+    ),
+    parentEventId: normalizeEventId(
+      firstSafe(analysis.parent_event_id, raw.parent_event_id, relation.parent_event_id)
+    ),
+  };
+}
+
+function setCausalLinkHints(row, causal) {
+  const loc = safeJSON(row.AZ_locators_json);
+  const locObj = loc && typeof loc === "object" && !Array.isArray(loc) ? { ...loc } : {};
+  const analysis =
+    locObj.analysis && typeof locObj.analysis === "object" && !Array.isArray(locObj.analysis)
+      ? { ...locObj.analysis }
+      : {};
+  const relationContext =
+    locObj.relation_context && typeof locObj.relation_context === "object" && !Array.isArray(locObj.relation_context)
+      ? { ...locObj.relation_context }
+      : {};
+
+  if (causal.related_interaction_id) {
+    relationContext.related_interaction_id = causal.related_interaction_id;
+  }
+  if (causal.parent_event_id) {
+    relationContext.related_event_id = causal.parent_event_id;
+  }
+
+  analysis.causal_chain_id = causal.causal_chain_id || null;
+  analysis.related_interaction_id = causal.related_interaction_id || null;
+  analysis.cause_event_id = causal.cause_event_id || null;
+  analysis.parent_event_id = causal.parent_event_id || null;
+
+  locObj.analysis = analysis;
+  if (Object.keys(relationContext).length > 0) locObj.relation_context = relationContext;
+  row.AZ_locators_json = locObj;
+
+  row._causal_chain_id = causal.causal_chain_id || null;
+  row._related_interaction_id = causal.related_interaction_id || null;
+  row._cause_event_id = causal.cause_event_id || null;
+  row._parent_event_id = causal.parent_event_id || null;
+}
+
+function assignCausalLinkHints(rows, cacheNamespace = "production") {
+  const items = rows.map((r, seq) => {
+    const locators = safeJSON(r.AZ_locators_json) || {};
+    const relation = relationContextFromLocators(locators);
+    const eventTsMs = resolveEventTsMs(r);
+    const interactionId = limitedSafe(relation.interactionId, 128);
+    const eventId = normalizeEventId(r.AZ_event_id);
+    return { r, seq, locators, relation, eventTsMs, interactionId, eventId };
+  }).sort((a, b) => a.eventTsMs - b.eventTsMs || a.seq - b.seq);
+
+  const interactionMap = new Map();
+  const now = Date.now();
+  const cacheKeyOf = (interactionId) => `${cacheNamespace}:${interactionId}`;
+
+  for (const item of items) {
+    const relatedInteractionId = item.relation.relatedInteractionId;
+    const relatedCacheKey = relatedInteractionId ? cacheKeyOf(relatedInteractionId) : null;
+    const parent =
+      (relatedInteractionId && interactionMap.get(relatedInteractionId)) ||
+      (relatedCacheKey ? causalChainCache.get(relatedCacheKey) : null) ||
+      null;
+
+    const parentAgeMs = parent?.eventTsMs != null ? item.eventTsMs - parent.eventTsMs : null;
+    const parentIsFresh =
+      parent && parentAgeMs != null && parentAgeMs >= 0 && parentAgeMs <= CAUSAL_CHAIN_TTL_MS;
+
+    const ownChainId = item.interactionId || item.eventId || `event:${item.seq}`;
+    const causalChainId =
+      item.relation.causalChainId ||
+      (parentIsFresh ? parent.causalChainId : null) ||
+      (relatedInteractionId && !parent ? relatedInteractionId : null) ||
+      ownChainId;
+    const causeEventId =
+      item.relation.causeEventId ||
+      (parentIsFresh ? parent.causeEventId : null) ||
+      (relatedInteractionId ? item.relation.relatedEventId : null) ||
+      item.eventId ||
+      null;
+    const parentEventId =
+      item.relation.parentEventId ||
+      (relatedInteractionId ? item.relation.relatedEventId || parent?.eventId || null : null);
+
+    const causal = {
+      causal_chain_id: limitedSafe(causalChainId, 128),
+      related_interaction_id: relatedInteractionId || null,
+      cause_event_id: normalizeEventId(causeEventId),
+      parent_event_id: normalizeEventId(parentEventId),
+    };
+    setCausalLinkHints(item.r, causal);
+
+    if (item.interactionId) {
+      const cacheValue = {
+        causalChainId: causal.causal_chain_id,
+        causeEventId: causal.cause_event_id,
+        eventId: item.eventId,
+        interactionId: item.interactionId,
+        eventTsMs: item.eventTsMs,
+        accessedAt: now,
+      };
+      interactionMap.set(item.interactionId, cacheValue);
+      causalChainCache.set(cacheKeyOf(item.interactionId), cacheValue);
+    }
+  }
 }
 
 function actionFromLocatorsJson(value) {
@@ -952,6 +1132,33 @@ async function resolveOrCreateSession(conn, r) {
   return newSid;
 }
 
+async function eventCausalColumnsSupported(conn, cacheNamespace = PRIMARY_DB_ENVIRONMENT) {
+  const cached = eventCausalColumnSupportCache.get(cacheNamespace);
+  if (cached && Date.now() - cached.checkedAt < 60000) return cached.supported;
+
+  const required = [
+    "causal_chain_id",
+    "related_interaction_id",
+    "cause_event_id",
+    "parent_event_id",
+  ];
+  const rows = await conn.query(
+    `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'events'
+        AND COLUMN_NAME IN (?, ?, ?, ?)`,
+    required
+  );
+  const found = new Set(rows.map((row) => row.COLUMN_NAME));
+  const supported = required.every((name) => found.has(name));
+  eventCausalColumnSupportCache.set(cacheNamespace, {
+    supported,
+    checkedAt: Date.now(),
+  });
+  return supported;
+}
+
 // ───────────────────── 한 배치 처리 ─────────────────────
 // 이 호출은 "기존 tasks/session 적재 로직은 유지"한 채,
 // 추가로 workflow 힌트만 side-channel로 심는 절충안입니다.
@@ -972,10 +1179,12 @@ async function processBatch(
   );
   // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지) 
   assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS, cacheNamespace);
+  assignCausalLinkHints(norm, cacheNamespace);
 
   const conn = await targetPool.getConnection();
   try {
     await conn.beginTransaction();
+    const supportsCausalColumns = await eventCausalColumnsSupported(conn, cacheNamespace);
     await upsertIdentitySeeds(conn, norm, log);
 
     // 1) 세션 upsert (세션ID 있는 것만)
@@ -1142,29 +1351,67 @@ async function processBatch(
 
       즉 원시 이벤트 적재와 분석 힌트 적재를 한 insert 에 묶은 상태입니다.
       */
+      const eventColumns = [
+        "event_id",
+        "session_id",
+        "task_id",
+        "event_time",
+        "event_type",
+        "page_url",
+        "target_selector",
+        "interaction_type",
+        "input_data",
+        "api_path",
+        "api_method",
+        "api_status_code",
+        "api_latency_ms",
+        "selector_xpath",
+        "element_tag",
+        "data_testid",
+        "locators_json",
+        "page_title",
+        "element_text",
+        "associated_label",
+        "workflow_key",
+        "workflow_index",
+        "step_duration_ms",
+      ];
+      const eventValues = [
+        r.AZ_event_id, // 이벤트 중복 방지 처리를 위한 고유 ID
+        sid,
+        ...evtTuple,
+        selector_xpath,
+        element_tag,
+        data_testid,
+        locators_json,
+        page_title,
+        element_text,
+        associated_label,
+        workflow_key,
+        workflow_index,
+        step_duration_ms,
+      ];
+      if (supportsCausalColumns) {
+        eventColumns.push(
+          "causal_chain_id",
+          "related_interaction_id",
+          "cause_event_id",
+          "parent_event_id"
+        );
+        eventValues.push(
+          r._causal_chain_id || null,
+          r._related_interaction_id || null,
+          r._cause_event_id || null,
+          r._parent_event_id || null
+        );
+      }
+
       const evtRes = await conn.query(
         `INSERT INTO events
-          (event_id, session_id, task_id, event_time, event_type, page_url, target_selector, interaction_type, input_data,
-            api_path, api_method, api_status_code, api_latency_ms,
-            selector_xpath, element_tag, data_testid, locators_json, page_title, element_text, associated_label,
-            workflow_key, workflow_index, step_duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (${eventColumns.join(", ")})
+        VALUES (${eventColumns.map(() => "?").join(", ")})
             ON DUPLICATE KEY UPDATE event_id = event_id`,
-        [
-          r.AZ_event_id, // 이벤트 중복 방지 처리를 위한 고유 ID
-          sid,
-          ...evtTuple,
-          selector_xpath,
-          element_tag,
-          data_testid,
-          locators_json,
-          page_title,
-          element_text,
-          associated_label,
-          workflow_key,
-          workflow_index,
-          step_duration_ms,
-        ]
+        eventValues
       );
 
       const eventId = evtRes.insertId;

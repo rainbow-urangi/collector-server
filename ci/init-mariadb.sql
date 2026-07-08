@@ -59,6 +59,10 @@ CREATE TABLE `events` (
   `step_duration_ms` int unsigned DEFAULT NULL,
   `workflow_key` varchar(128) DEFAULT NULL,
   `workflow_outcome` varchar(20) DEFAULT NULL,
+  `causal_chain_id` varchar(128) DEFAULT NULL,
+  `related_interaction_id` varchar(128) DEFAULT NULL,
+  `cause_event_id` varchar(64) DEFAULT NULL,
+  `parent_event_id` varchar(64) DEFAULT NULL,
   `event_time` datetime(6) NOT NULL,
   `event_type` enum('DOM_EVENT','API_REQUEST','PAGE_VIEW') NOT NULL,
   `page_url` varchar(2048) NOT NULL,
@@ -81,5 +85,9 @@ CREATE TABLE `events` (
   KEY `idx_task_id_event_time` (`task_id`, `event_time`),
   KEY `idx_session_id` (`session_id`),
   KEY `idx_workflow_key` (`workflow_key`),
+  KEY `idx_causal_chain_id` (`causal_chain_id`),
+  KEY `idx_related_interaction_id` (`related_interaction_id`),
+  KEY `idx_cause_event_id` (`cause_event_id`),
+  KEY `idx_parent_event_id` (`parent_event_id`),
   CONSTRAINT `fk_events_task_id` FOREIGN KEY (`task_id`) REFERENCES `tasks` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
