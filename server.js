@@ -486,6 +486,29 @@ function actionFromLocatorsJson(value) {
 }
 
 // actor 별 workflow index 할당
+function apiPathFromLocatorsJson(value) {
+  const locators = safeJSON(value);
+  const apiContext =
+    locators?.api_context ||
+    locators?.raw_payload?.api_context ||
+    locators?.raw_payload?.legacy?.api_context ||
+    locators?.legacy?.api_context;
+  const requestContext =
+    locators?.request_context ||
+    locators?.raw_payload?.request_context ||
+    locators?.raw_payload?.legacy?.request_context ||
+    locators?.legacy?.request_context;
+
+  return (
+    SAFE(apiContext?.url_path) ||
+    SAFE(apiContext?.path) ||
+    SAFE(apiContext?.url) ||
+    SAFE(requestContext?.url_path) ||
+    SAFE(requestContext?.api_path) ||
+    SAFE(requestContext?.url)
+  );
+}
+
 function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS, cacheNamespace = "production") {
   try {
     // 각 row를 item 구조로 변환 
@@ -757,6 +780,9 @@ function toEventTuple(r, taskId) {
   // else {
   //   api_path_raw = normalizeApiPath(api_path_raw); // 혹시 풀 URL/질의 포함해도 정규화
   // }
+  if (!api_path_raw) {
+    api_path_raw = apiPathFromLocatorsJson(r.AZ_locators_json);
+  }
   const api_path = normalizeApiPath(api_path_raw);
 
   // 길이 제한
