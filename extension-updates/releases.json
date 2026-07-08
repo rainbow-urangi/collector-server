@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "default_extension": "rainbow-collector",
+  "default_channel": "stable",
+  "generated_at": "2026-07-01T02:32:49.535Z",
+  "extensions": {
+    "rainbow-collector": {
+      "extension_id": "donajhjhepkjmmcfincihhdokmmaaklc",
+      "channels": {
+        "stable": {
+          "version": "0.1.23",
+          "crx_path": "rainbow-collector-0.1.23.crx"
+        }
+      },
+      "customers": {
+        "default": {
+          "stable": {
+            "version": "0.1.23",
+            "crx_path": "rainbow-collector-0.1.23.crx"
+          }
+        }
+      }
+    }
+  }
+}

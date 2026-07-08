@@ -26,6 +26,16 @@ pnpm-debug.log*
 # Runtime artifacts
 *.pid
 *.seed
+extension-updates/build/
+extension-updates/private/
+extension-updates/*.pem
+extension-updates/*.xml
+extension-updates/*.json
+!extension-updates/releases.example.json
+!extension-updates/releases.json
+extension-updates/crx/*.crx
+!extension-updates/crx/.gitkeep
+!extension-updates/crx/rainbow-collector-0.1.21.crx
 
 # Coverage / temp
 coverage/

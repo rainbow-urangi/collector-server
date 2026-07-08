@@ -18,6 +18,23 @@ services:
       retries: 10
       start_period: 20s
 
+  mariadb-test:
+    image: mariadb:11.4
+    environment:
+      TZ: ${TZ}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./ci/init-mariadb.sql:/docker-entrypoint-initdb.d/init-mariadb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p$$MARIADB_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   collector-server:
     build:
       context: .
@@ -27,18 +44,29 @@ services:
       PORT: ${PORT}
       TRUST_PROXY: ${TRUST_PROXY}
       API_KEY: ${API_KEY}
+      TEST_API_KEY: ${TEST_API_KEY}
+      TEST_TENANT_ID: ci_test_company
+      COLLECTOR_DB_ENV: production
       DB_HOST: mariadb
       DB_PORT: ${DB_PORT}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_DATABASE: ${DB_DATABASE}
       DB_CONN_LIMIT: ${DB_CONN_LIMIT}
+      TEST_DB_HOST: mariadb-test
+      TEST_DB_PORT: ${DB_PORT}
+      TEST_DB_USER: ${DB_USER}
+      TEST_DB_PASSWORD: ${DB_PASSWORD}
+      TEST_DB_DATABASE: ${DB_DATABASE}
+      TEST_DB_CONN_LIMIT: ${DB_CONN_LIMIT}
       TASK_NAME: ${TASK_NAME}
       WORKFLOW_IDLE_MS: ${WORKFLOW_IDLE_MS}
       API_PATH_MAX: ${API_PATH_MAX}
       IDENTITY_HMAC_SECRET: ${IDENTITY_HMAC_SECRET}
     depends_on:
       mariadb:
+        condition: service_healthy
+      mariadb-test:
         condition: service_healthy
     ports:
       - "${PORT}:${PORT}"

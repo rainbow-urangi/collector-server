@@ -23,6 +23,21 @@ const {
   upsertIdentitySeeds,
   startIdentityAllocator,
 } = require("./src/identity");
+const {
+  normalizeEnvironment,
+  readKeyMapFromEnvironment,
+  readOptionalDbConfig,
+  resolveCollectorIdentity,
+  validateDatabaseSeparation,
+  validateKeySeparation,
+} = require("./src/collectorRouting");
+const {
+  applyServerQualityGuard,
+  buildQualityRuntimeConfig,
+} = require("./src/collectorQuality");
+const {
+  registerExtensionUpdateRoutes,
+} = require("./src/extensionUpdate");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
 
@@ -82,6 +97,10 @@ function normalizeSnapshotJson(value) {
 
 // ───────────────────── DB Pool ─────────────────────
 let pool;
+const databasePools = new Map();
+const PRIMARY_DB_ENVIRONMENT = normalizeEnvironment(
+  process.env.COLLECTOR_DB_ENV || "production"
+);
 const dbConfig = {
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 3306),
@@ -91,15 +110,30 @@ const dbConfig = {
   connectionLimit: Number(process.env.DB_CONN_LIMIT || 10),
   connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 };
+const SECONDARY_DB_ENVIRONMENT =
+  PRIMARY_DB_ENVIRONMENT === "production" ? "test" : "production";
+const secondaryDbConfig = readOptionalDbConfig(
+  SECONDARY_DB_ENVIRONMENT,
+  SECONDARY_DB_ENVIRONMENT === "production" ? "PROD_" : "TEST_",
+  Number(process.env.DB_CONN_LIMIT || 10)
+);
+validateDatabaseSeparation(dbConfig, secondaryDbConfig);
 
 // actor 별 워크플로우 상태 캐시
 const actorCache = new Map();
+const causalChainCache = new Map();
+const eventCausalColumnSupportCache = new Map();
+const CAUSAL_CHAIN_TTL_MS = Number(process.env.CAUSAL_CHAIN_TTL_MS || 5000);
 
 // 캐시 메모리 정리 스케줄러
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const [key, val] of actorCache) {
     if (val.accessedAt < cutoff) actorCache.delete(key);
+  }
+  const causalCutoff = Date.now() - Math.max(CAUSAL_CHAIN_TTL_MS * 4, 60000);
+  for (const [key, val] of causalChainCache) {
+    if ((val.accessedAt || 0) < causalCutoff) causalChainCache.delete(key);
   }
 }, 60 * 60 * 1000);
 
@@ -121,7 +155,20 @@ function requireApiKey(req, res, next) {
 */
 
 // Tenant
-const TENANT_KEY_MAP = JSON.parse(process.env.TENANT_KEYS || '{}');
+const TENANT_KEY_MAP = readKeyMapFromEnvironment("TENANT_KEYS", "tenant_keys");
+const TEST_TENANT_KEY_MAP = readKeyMapFromEnvironment(
+  "TEST_TENANT_KEYS",
+  "test_tenant_keys"
+);
+const collectorKeyOptions = {
+  productionApiKey: process.env.API_KEY || "",
+  productionTenantId: process.env.PRODUCTION_TENANT_ID || null,
+  productionTenantKeys: TENANT_KEY_MAP,
+  testApiKey: process.env.TEST_API_KEY || "",
+  testTenantId: process.env.TEST_TENANT_ID || "test_company",
+  testTenantKeys: TEST_TENANT_KEY_MAP,
+};
+validateKeySeparation(collectorKeyOptions);
 const IDENTITY_HMAC_SECRET = process.env.IDENTITY_HMAC_SECRET || "";
 const IDENTITY_ALLOCATOR_INTERVAL_MS = Number(process.env.IDENTITY_ALLOCATOR_INTERVAL_MS || 3000);
 const IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT || 20);
@@ -130,10 +177,12 @@ const IDENTITY_ALLOCATOR_BATCH_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_BAT
 function requireApiKey(req, res, next) {
   // 창 종료 시 api_key 쿼리 파라미터 사용 가능
   const k = req.get("x-api-key") || req.query.api_key; // 요청 헤더에서 x-api-key 헤더 값 또는 쿼리 파라미터에서 api_key 값 가져옴
-  // if (!k || k !== process.env.API_KEY) return res.status(401).json({ error: "unauthorized" }); // API_KEY와 일치하지 않으면 401 오류 반환
-  const valid = (k === process.env.API_KEY) ||
-                Object.prototype.hasOwnProperty.call(TENANT_KEY_MAP, k);
-  if (!k || !valid) return res.status(401).json({ error: "unauthorized" });
+  const identity = resolveCollectorIdentity(k, collectorKeyOptions);
+  if (!identity) return res.status(401).json({ error: "unauthorized" });
+  req.collectorContext = {
+    ...identity,
+    pool: databasePools.get(identity.environment) || null,
+  };
   next();
 }
 app.use(async (req, res, next) => {
@@ -182,6 +231,8 @@ const USER_RELEVANT_ACTIONS = new Set([
   "pointerdown",
   "pointerup",
   "page_close",
+  "popup_open",
+  "popup_close",
 ]);
 
 // 오류 키워드 정규식 정의
@@ -254,8 +305,7 @@ const betterUserId = (prev, next) => {
 //   SAFE(req.get("x-tenant")) ||
 //   null;
 const parseTenantId = (req, row) => {
-  const k = req.get("x-api-key") || req.query.api_key;
-  return TENANT_KEY_MAP[k] || null;
+  return req.collectorContext?.tenantId || null;
 };
 
 // 길이 클램프 & 정규화 유틸
@@ -430,8 +480,216 @@ function setActorWorkflowHints(row, actorKey, workflowIndex, eventTsMs, step_dur
   // 최종 객체를 row.AZ_locators_json에 삽입
   row.AZ_locators_json = locObj;
 }
+
+function limitedSafe(value, maxLen = 128) {
+  const s = SAFE(value);
+  if (!s) return null;
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+}
+
+function firstSafe(...values) {
+  for (const value of values) {
+    const s = SAFE(value);
+    if (s) return s;
+  }
+  return null;
+}
+
+function normalizeEventId(value) {
+  return limitedSafe(value, 64);
+}
+
+function relationContextFromLocators(locators) {
+  if (!locators || typeof locators !== "object" || Array.isArray(locators)) return {};
+  const raw = locators.raw_payload && typeof locators.raw_payload === "object" ? locators.raw_payload : {};
+  const legacy = raw.legacy && typeof raw.legacy === "object" ? raw.legacy : {};
+  const relation =
+    locators.relation_context ||
+    raw.relation_context ||
+    legacy.relation_context ||
+    {};
+  const eventContext =
+    locators.event_context ||
+    raw.event_context ||
+    legacy.event_context ||
+    {};
+  const analysis =
+    locators.analysis && typeof locators.analysis === "object" && !Array.isArray(locators.analysis)
+      ? locators.analysis
+      : {};
+
+  return {
+    interactionId: limitedSafe(
+      firstSafe(analysis.interaction_id, eventContext.interaction_id, raw.interaction_id),
+      128
+    ),
+    relatedInteractionId: limitedSafe(
+      firstSafe(
+        relation.related_interaction_id,
+        raw.related_interaction_id,
+        eventContext.related_interaction_id
+      ),
+      128
+    ),
+    relatedEventId: normalizeEventId(
+      firstSafe(relation.related_event_id, raw.related_event_id, eventContext.related_event_id)
+    ),
+    relatedAction: limitedSafe(
+      firstSafe(relation.related_action, raw.related_action, eventContext.related_action),
+      64
+    ),
+    relatedStrategy: limitedSafe(
+      firstSafe(relation.related_strategy, raw.related_strategy, eventContext.related_strategy),
+      64
+    ),
+    causalChainId: limitedSafe(
+      firstSafe(analysis.causal_chain_id, raw.causal_chain_id, relation.causal_chain_id),
+      128
+    ),
+    causeEventId: normalizeEventId(
+      firstSafe(analysis.cause_event_id, raw.cause_event_id, relation.cause_event_id)
+    ),
+    parentEventId: normalizeEventId(
+      firstSafe(analysis.parent_event_id, raw.parent_event_id, relation.parent_event_id)
+    ),
+  };
+}
+
+function setCausalLinkHints(row, causal) {
+  const loc = safeJSON(row.AZ_locators_json);
+  const locObj = loc && typeof loc === "object" && !Array.isArray(loc) ? { ...loc } : {};
+  const analysis =
+    locObj.analysis && typeof locObj.analysis === "object" && !Array.isArray(locObj.analysis)
+      ? { ...locObj.analysis }
+      : {};
+  const relationContext =
+    locObj.relation_context && typeof locObj.relation_context === "object" && !Array.isArray(locObj.relation_context)
+      ? { ...locObj.relation_context }
+      : {};
+
+  if (causal.related_interaction_id) {
+    relationContext.related_interaction_id = causal.related_interaction_id;
+  }
+  if (causal.parent_event_id) {
+    relationContext.related_event_id = causal.parent_event_id;
+  }
+
+  analysis.causal_chain_id = causal.causal_chain_id || null;
+  analysis.related_interaction_id = causal.related_interaction_id || null;
+  analysis.cause_event_id = causal.cause_event_id || null;
+  analysis.parent_event_id = causal.parent_event_id || null;
+
+  locObj.analysis = analysis;
+  if (Object.keys(relationContext).length > 0) locObj.relation_context = relationContext;
+  row.AZ_locators_json = locObj;
+
+  row._causal_chain_id = causal.causal_chain_id || null;
+  row._related_interaction_id = causal.related_interaction_id || null;
+  row._cause_event_id = causal.cause_event_id || null;
+  row._parent_event_id = causal.parent_event_id || null;
+}
+
+function assignCausalLinkHints(rows, cacheNamespace = "production") {
+  const items = rows.map((r, seq) => {
+    const locators = safeJSON(r.AZ_locators_json) || {};
+    const relation = relationContextFromLocators(locators);
+    const eventTsMs = resolveEventTsMs(r);
+    const interactionId = limitedSafe(relation.interactionId, 128);
+    const eventId = normalizeEventId(r.AZ_event_id);
+    return { r, seq, locators, relation, eventTsMs, interactionId, eventId };
+  }).sort((a, b) => a.eventTsMs - b.eventTsMs || a.seq - b.seq);
+
+  const interactionMap = new Map();
+  const now = Date.now();
+  const cacheKeyOf = (interactionId) => `${cacheNamespace}:${interactionId}`;
+
+  for (const item of items) {
+    const relatedInteractionId = item.relation.relatedInteractionId;
+    const relatedCacheKey = relatedInteractionId ? cacheKeyOf(relatedInteractionId) : null;
+    const parent =
+      (relatedInteractionId && interactionMap.get(relatedInteractionId)) ||
+      (relatedCacheKey ? causalChainCache.get(relatedCacheKey) : null) ||
+      null;
+
+    const parentAgeMs = parent?.eventTsMs != null ? item.eventTsMs - parent.eventTsMs : null;
+    const parentIsFresh =
+      parent && parentAgeMs != null && parentAgeMs >= 0 && parentAgeMs <= CAUSAL_CHAIN_TTL_MS;
+
+    const ownChainId = item.interactionId || item.eventId || `event:${item.seq}`;
+    const causalChainId =
+      item.relation.causalChainId ||
+      (parentIsFresh ? parent.causalChainId : null) ||
+      (relatedInteractionId && !parent ? relatedInteractionId : null) ||
+      ownChainId;
+    const causeEventId =
+      item.relation.causeEventId ||
+      (parentIsFresh ? parent.causeEventId : null) ||
+      (relatedInteractionId ? item.relation.relatedEventId : null) ||
+      item.eventId ||
+      null;
+    const parentEventId =
+      item.relation.parentEventId ||
+      (relatedInteractionId ? item.relation.relatedEventId || parent?.eventId || null : null);
+
+    const causal = {
+      causal_chain_id: limitedSafe(causalChainId, 128),
+      related_interaction_id: relatedInteractionId || null,
+      cause_event_id: normalizeEventId(causeEventId),
+      parent_event_id: normalizeEventId(parentEventId),
+    };
+    setCausalLinkHints(item.r, causal);
+
+    if (item.interactionId) {
+      const cacheValue = {
+        causalChainId: causal.causal_chain_id,
+        causeEventId: causal.cause_event_id,
+        eventId: item.eventId,
+        interactionId: item.interactionId,
+        eventTsMs: item.eventTsMs,
+        accessedAt: now,
+      };
+      interactionMap.set(item.interactionId, cacheValue);
+      causalChainCache.set(cacheKeyOf(item.interactionId), cacheValue);
+    }
+  }
+}
+
+function actionFromLocatorsJson(value) {
+  const locators = safeJSON(value);
+  const action =
+    locators?.raw_payload?.event_context?.action ||
+    locators?.event_context?.action ||
+    locators?.raw_payload?.action ||
+    locators?.action;
+
+  return SAFE(action);
+}
+
 // actor 별 workflow index 할당
-function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
+function apiPathFromLocatorsJson(value) {
+  const locators = safeJSON(value);
+  const apiContext =
+    locators?.api_context ||
+    locators?.raw_payload?.api_context ||
+    locators?.raw_payload?.legacy?.api_context ||
+    locators?.legacy?.api_context;
+  const requestContext =
+    locators?.request_context ||
+    locators?.raw_payload?.request_context ||
+    locators?.raw_payload?.legacy?.request_context ||
+    locators?.legacy?.request_context;
+
+  return (
+    SAFE(apiContext?.url_path) ||
+    SAFE(apiContext?.path) ||
+    SAFE(apiContext?.url) ||
+    SAFE(requestContext?.url_path) ||
+    SAFE(requestContext?.api_path) ||
+    SAFE(requestContext?.url)
+  );
+}
+
+function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS, cacheNamespace = "production") {
   try {
     // 각 row를 item 구조로 변환 
     // (r: row, seq: 순서, eventTsMs: 이벤트 시간, actorKey: 유저 행동 키, workflowIndex: 초기값 1)
@@ -459,7 +717,8 @@ function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
       bucket.sort((a, b) => a.eventTsMs - b.eventTsMs || a.seq - b.seq);
 
       // 캐시에서 워크플로우 상태 조회
-      const cached = actorCache.get(bucket[0].actorKey);
+      const actorCacheKey = `${cacheNamespace}:${bucket[0].actorKey}`;
+      const cached = actorCache.get(actorCacheKey);
       // workflow index 초기값 1
       let workflowIndex = cached?.workflowIndex ?? 1;
       // 현재 workflow에 이벤트가 하나라도 들어갔는지 확인
@@ -525,7 +784,7 @@ function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS) {
         }
       }
       // 현재 배치 결과를 캐시에 저장
-      actorCache.set(bucket[0].actorKey, {
+      actorCache.set(actorCacheKey, {
         lastRelevantTs,
         workflowIndex,
         accessedAt: Date.now(),
@@ -589,6 +848,8 @@ function enrichRow(row, clientIp, tenantId) {
     r.AZ_aria_label      = r.AZ_aria_label      ?? L.a11y.ariaLabel ?? null;
     r.AZ_aria_labelledby = r.AZ_aria_labelledby ?? L.a11y.ariaLabelledby ?? null;
   }
+
+  r.AZ_event_action = r.AZ_event_action || actionFromLocatorsJson(r.AZ_locators_json);
 
   // 이벤트 액션이 없을 경우 요소 타입에 따라 기본값 설정
   if (!r.AZ_event_action) {
@@ -663,9 +924,11 @@ function toEventTuple(r, taskId) {
 - api_latency_ms 를 별도 적재
 */
 function toEventTuple(r, taskId) {
+  const action = (SAFE(r.AZ_event_action) || "").toLowerCase();
+
   // 이벤트 유형 설정 (PAGE_VIEW 또는 DOM_EVENT)
   const event_type =
-    r.AZ_event_action === "page_view" || r.AZ_element_type === "page"
+    action === "page_view" || r.AZ_element_type === "page"
       ? "PAGE_VIEW"
       : "DOM_EVENT";
 
@@ -676,20 +939,12 @@ function toEventTuple(r, taskId) {
     //     "DOM_EVENT";
 
   // 상호작용(이벤트) 유형 설정 (기본 "change")
-  let interaction_type = "change";
-  if (r.AZ_element_type === "menu" || r.AZ_event_action === "menu_click" || r.AZ_event_action === 'click')
-    interaction_type = "click";
-  else if (r.AZ_event_action === "event")
+  let interaction_type = action || "change";
+  if (action === "event")
     interaction_type = r.AZ_event_subtype || "event";
-  else if (r.AZ_event_action === "route_change") interaction_type = "spa";
-  else if (r.AZ_event_action === "post_state") interaction_type = "state";
-  else if (r.AZ_event_action === "submit") interaction_type = "submit";
-  else if (r.AZ_event_action === "api_response") interaction_type = "api_response";
-  else if (r.AZ_event_action === "blur") interaction_type = "blur";
-  else if (r.AZ_event_action === "focus") interaction_type = "focus";
-  else if (r.AZ_event_action === 'visibility_change') interaction_type = 'visibility_change';
-  else if (r.AZ_event_action === 'page_close') interaction_type = 'page_close';
-  else if (r.AZ_event_action === 'page_view') interaction_type = 'page_view';
+  else if (action === "post_state") interaction_type = "state";
+  else if (action === "menu_click" || action === "click" || (!action && r.AZ_element_type === "menu"))
+    interaction_type = "click";
   // 입력 데이터 설정 (이벤트, 메뉴, 상태 타입이 아닐 경우 null)
   const input_data = r.AZ_data ?? null;
   // const input_data = ["event", "menu", "state"].includes(r.AZ_element_type || "")
@@ -705,6 +960,9 @@ function toEventTuple(r, taskId) {
   // else {
   //   api_path_raw = normalizeApiPath(api_path_raw); // 혹시 풀 URL/질의 포함해도 정규화
   // }
+  if (!api_path_raw) {
+    api_path_raw = apiPathFromLocatorsJson(r.AZ_locators_json);
+  }
   const api_path = normalizeApiPath(api_path_raw);
 
   // 길이 제한
@@ -874,23 +1132,59 @@ async function resolveOrCreateSession(conn, r) {
   return newSid;
 }
 
+async function eventCausalColumnsSupported(conn, cacheNamespace = PRIMARY_DB_ENVIRONMENT) {
+  const cached = eventCausalColumnSupportCache.get(cacheNamespace);
+  if (cached && Date.now() - cached.checkedAt < 60000) return cached.supported;
+
+  const required = [
+    "causal_chain_id",
+    "related_interaction_id",
+    "cause_event_id",
+    "parent_event_id",
+  ];
+  const rows = await conn.query(
+    `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'events'
+        AND COLUMN_NAME IN (?, ?, ?, ?)`,
+    required
+  );
+  const found = new Set(rows.map((row) => row.COLUMN_NAME));
+  const supported = required.every((name) => found.has(name));
+  eventCausalColumnSupportCache.set(cacheNamespace, {
+    supported,
+    checkedAt: Date.now(),
+  });
+  return supported;
+}
+
 // ───────────────────── 한 배치 처리 ─────────────────────
 // 이 호출은 "기존 tasks/session 적재 로직은 유지"한 채,
 // 추가로 workflow 힌트만 side-channel로 심는 절충안입니다.
 // 즉 DB의 주 적재 구조를 갈아엎지 않고, 후속 프로세스 분석용 열(workflow_key/index)만 확장합니다.
-async function processBatch(rows, clientIp, tenantId) {
+async function processBatch(
+  rows,
+  clientIp,
+  tenantId,
+  targetPool = pool,
+  cacheNamespace = PRIMARY_DB_ENVIRONMENT
+) {
   if (!rows.length) return { inserted: 0, snapshots: 0 };
+  if (!targetPool) throw new Error(`collector_database_unavailable:${cacheNamespace}`);
 
   // 0) 보강
   const norm = rows.map((r) =>
     applyIdentity(enrichRow(r, clientIp, tenantId), IDENTITY_HMAC_SECRET)
   );
   // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지) 
-  assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS);
+  assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS, cacheNamespace);
+  assignCausalLinkHints(norm, cacheNamespace);
 
-  const conn = await pool.getConnection();
+  const conn = await targetPool.getConnection();
   try {
     await conn.beginTransaction();
+    const supportsCausalColumns = await eventCausalColumnsSupported(conn, cacheNamespace);
     await upsertIdentitySeeds(conn, norm, log);
 
     // 1) 세션 upsert (세션ID 있는 것만)
@@ -1057,29 +1351,67 @@ async function processBatch(rows, clientIp, tenantId) {
 
       즉 원시 이벤트 적재와 분석 힌트 적재를 한 insert 에 묶은 상태입니다.
       */
+      const eventColumns = [
+        "event_id",
+        "session_id",
+        "task_id",
+        "event_time",
+        "event_type",
+        "page_url",
+        "target_selector",
+        "interaction_type",
+        "input_data",
+        "api_path",
+        "api_method",
+        "api_status_code",
+        "api_latency_ms",
+        "selector_xpath",
+        "element_tag",
+        "data_testid",
+        "locators_json",
+        "page_title",
+        "element_text",
+        "associated_label",
+        "workflow_key",
+        "workflow_index",
+        "step_duration_ms",
+      ];
+      const eventValues = [
+        r.AZ_event_id, // 이벤트 중복 방지 처리를 위한 고유 ID
+        sid,
+        ...evtTuple,
+        selector_xpath,
+        element_tag,
+        data_testid,
+        locators_json,
+        page_title,
+        element_text,
+        associated_label,
+        workflow_key,
+        workflow_index,
+        step_duration_ms,
+      ];
+      if (supportsCausalColumns) {
+        eventColumns.push(
+          "causal_chain_id",
+          "related_interaction_id",
+          "cause_event_id",
+          "parent_event_id"
+        );
+        eventValues.push(
+          r._causal_chain_id || null,
+          r._related_interaction_id || null,
+          r._cause_event_id || null,
+          r._parent_event_id || null
+        );
+      }
+
       const evtRes = await conn.query(
         `INSERT INTO events
-          (event_id, session_id, task_id, event_time, event_type, page_url, target_selector, interaction_type, input_data,
-            api_path, api_method, api_status_code, api_latency_ms,
-            selector_xpath, element_tag, data_testid, locators_json, page_title, element_text, associated_label,
-            workflow_key, workflow_index, step_duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (${eventColumns.join(", ")})
+        VALUES (${eventColumns.map(() => "?").join(", ")})
             ON DUPLICATE KEY UPDATE event_id = event_id`,
-        [
-          r.AZ_event_id, // 이벤트 중복 방지 처리를 위한 고유 ID
-          sid,
-          ...evtTuple,
-          selector_xpath,
-          element_tag,
-          data_testid,
-          locators_json,
-          page_title,
-          element_text,
-          associated_label,
-          workflow_key,
-          workflow_index,
-          step_duration_ms,
-        ]
+        eventValues
       );
 
       const eventId = evtRes.insertId;
@@ -1168,6 +1500,14 @@ async function processBatch(rows, clientIp, tenantId) {
 }
 
 // ───────────────────── 라우트 ─────────────────────
+registerExtensionUpdateRoutes(app);
+
+app.get("/collector/runtime-config", requireApiKey, (req, res) => {
+  res.json(buildQualityRuntimeConfig({
+    environment: req.collectorContext?.environment || PRIMARY_DB_ENVIRONMENT,
+  }));
+});
+
 // 확장 SW 호출 바디: { reason, rows: [ AZ_*... (옵션) snapshot:{} ], ts }
 /*
 CHANGE NOTE: code_after 의 ingest route 는 JSON body 기준만 전제했습니다.
@@ -1186,6 +1526,14 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
 */
 app.post("/ingest/batch", requireApiKey, async (req, res) => {
   try {
+    const collectorContext = req.collectorContext;
+    if (!collectorContext?.pool) {
+      return res.status(503).json({
+        error: "collector_database_unavailable",
+        collector_environment: collectorContext?.environment || null,
+      });
+    }
+
     // 창 종료 시 텍스트 본문 처리
     let requestBody = req.body;
     if (typeof requestBody === 'string') {
@@ -1298,14 +1646,29 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
       o._tenant_id = tenantIdPerRow(r);
       return o;
     });
+    const runtimeConfig = buildQualityRuntimeConfig({
+      environment: collectorContext.environment,
+    });
+    const guarded = applyServerQualityGuard(filled, {
+      config: runtimeConfig,
+      environment: collectorContext.environment,
+    });
 
-    const result = await processBatch(filled, clientIp, null);
+    const result = await processBatch(
+      guarded.rows,
+      clientIp,
+      collectorContext.tenantId,
+      collectorContext.pool,
+      collectorContext.environment
+    );
     res.json({
       ok: true,
+      collector_environment: collectorContext.environment,
       received_rows: rows.length,
       inserted_events: result.inserted,
       duplicate_events: result.duplicates,
       inserted_snapshots: result.snapshots,
+      quality: guarded.summary,
     });
   } catch (e) {
     log.error(e);
@@ -1464,11 +1827,21 @@ async function start() {
 
   const mariadb = await import("mariadb");
   pool = mariadb.createPool(dbConfig);
+  databasePools.set(PRIMARY_DB_ENVIRONMENT, pool);
   startIdentityAllocator(pool, log, {
     intervalMs: IDENTITY_ALLOCATOR_INTERVAL_MS,
     tenantScanLimit: IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT,
     batchLimit: IDENTITY_ALLOCATOR_BATCH_LIMIT,
   });
+  if (secondaryDbConfig) {
+    const secondaryPool = mariadb.createPool(secondaryDbConfig);
+    databasePools.set(SECONDARY_DB_ENVIRONMENT, secondaryPool);
+    startIdentityAllocator(secondaryPool, log, {
+      intervalMs: IDENTITY_ALLOCATOR_INTERVAL_MS,
+      tenantScanLimit: IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT,
+      batchLimit: IDENTITY_ALLOCATOR_BATCH_LIMIT,
+    });
+  }
   app.listen(port, () => log.info(`direct ingest listening :${port}`));
 }
 
