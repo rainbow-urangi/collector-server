@@ -473,6 +473,18 @@ function setActorWorkflowHints(row, actorKey, workflowIndex, eventTsMs, step_dur
   // 최종 객체를 row.AZ_locators_json에 삽입
   row.AZ_locators_json = locObj;
 }
+
+function actionFromLocatorsJson(value) {
+  const locators = safeJSON(value);
+  const action =
+    locators?.raw_payload?.event_context?.action ||
+    locators?.event_context?.action ||
+    locators?.raw_payload?.action ||
+    locators?.action;
+
+  return SAFE(action);
+}
+
 // actor 별 workflow index 할당
 function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS, cacheNamespace = "production") {
   try {
@@ -634,6 +646,8 @@ function enrichRow(row, clientIp, tenantId) {
     r.AZ_aria_labelledby = r.AZ_aria_labelledby ?? L.a11y.ariaLabelledby ?? null;
   }
 
+  r.AZ_event_action = r.AZ_event_action || actionFromLocatorsJson(r.AZ_locators_json);
+
   // 이벤트 액션이 없을 경우 요소 타입에 따라 기본값 설정
   if (!r.AZ_event_action) {
     if (r.AZ_element_type === "menu") r.AZ_event_action = "menu_click"; // 메뉴 클릭
@@ -707,9 +721,11 @@ function toEventTuple(r, taskId) {
 - api_latency_ms 를 별도 적재
 */
 function toEventTuple(r, taskId) {
+  const action = (SAFE(r.AZ_event_action) || "").toLowerCase();
+
   // 이벤트 유형 설정 (PAGE_VIEW 또는 DOM_EVENT)
   const event_type =
-    r.AZ_event_action === "page_view" || r.AZ_element_type === "page"
+    action === "page_view" || r.AZ_element_type === "page"
       ? "PAGE_VIEW"
       : "DOM_EVENT";
 
@@ -720,23 +736,12 @@ function toEventTuple(r, taskId) {
     //     "DOM_EVENT";
 
   // 상호작용(이벤트) 유형 설정 (기본 "change")
-  let interaction_type = "change";
-  if (r.AZ_element_type === "menu" || r.AZ_event_action === "menu_click" || r.AZ_event_action === 'click')
-    interaction_type = "click";
-  else if (r.AZ_event_action === "event")
+  let interaction_type = action || "change";
+  if (action === "event")
     interaction_type = r.AZ_event_subtype || "event";
-  else if (r.AZ_event_action === "route_change") interaction_type = "spa";
-  else if (r.AZ_event_action === "post_state") interaction_type = "state";
-  else if (r.AZ_event_action === "submit") interaction_type = "submit";
-  else if (r.AZ_event_action === "api_response") interaction_type = "api_response";
-  else if (r.AZ_event_action === "blur") interaction_type = "blur";
-  else if (r.AZ_event_action === "focus") interaction_type = "focus";
-  else if (r.AZ_event_action === 'visibility_change') interaction_type = 'visibility_change';
-  else if (r.AZ_event_action === 'page_close') interaction_type = 'page_close';
-  else if (r.AZ_event_action === 'page_view') interaction_type = 'page_view';
-  else if (r.AZ_event_action === "popup_open") interaction_type = "popup_open";
-  else if (r.AZ_event_action === "popup_close") interaction_type = "popup_close";
-  else if (r.AZ_event_action === "ui_outcome") interaction_type = "ui_outcome";
+  else if (action === "post_state") interaction_type = "state";
+  else if (action === "menu_click" || action === "click" || (!action && r.AZ_element_type === "menu"))
+    interaction_type = "click";
   // 입력 데이터 설정 (이벤트, 메뉴, 상태 타입이 아닐 경우 null)
   const input_data = r.AZ_data ?? null;
   // const input_data = ["event", "menu", "state"].includes(r.AZ_element_type || "")
