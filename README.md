@@ -140,6 +140,11 @@ Chrome Enterprise 정책으로 설치된 사내 배포용 extension은 서버의
 npm run package:extension
 ```
 
+확장은 `config.local.js`나 `COLLECTOR_PROD_KEY` 없이 패키징할 수 있습니다. 최초 실행 시
+설치 ID를 생성하고 `/ingest/batch?bootstrap=device-token`에서 만료형 장치 토큰을 자동으로
+발급받아 `chrome.storage.local`에 저장합니다. 이 토큰은 운영 환경으로 라우팅되며 기존
+`API_KEY` 인증도 호환을 위해 계속 지원합니다.
+
 주요 산출물:
 
 ```text
@@ -151,12 +156,24 @@ extension-updates/
 ├── extension-settings.policy.json
 ├── crx/
 │   └── rainbow-collector-<version>.crx
+├── native-host/
+│   ├── RainbowNetworkHost.cs
+│   ├── install-native-host.ps1
+│   ├── install-production.ps1
+│   └── uninstall-native-host.ps1
 └── private/
     └── rainbow-collector.pem
 ```
 
 `private/*.pem`은 extension ID를 결정하는 서명키이므로 Git에 올리면 안 됩니다.
 운영에서는 Secret Manager, HSM, 오프라인 서명 저장소 중 하나로 관리해야 합니다.
+
+각 Windows 수집 PC에서는 CRX 설치 후 다음 스크립트를 한 번 실행해야 정확한 로컬
+IPv4가 수집됩니다.
+
+```powershell
+.\extension-updates\native-host\install-production.ps1
+```
 
 업데이트 라우트:
 

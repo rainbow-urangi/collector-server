@@ -13,8 +13,9 @@ const chromePath =
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const sourceDir = path.resolve(
   process.env.COLLECTOR_EXTENSION_SOURCE_DIR ||
-    path.join(projectRoot, "..", "rainbow_visualization_test", "collector_test", "extension")
+    path.join(projectRoot, "..", "rainbow")
 );
+const nativeHostSourceDir = path.join(sourceDir, "native-host");
 const outputRoot = path.resolve(
   process.env.COLLECTOR_EXTENSION_OUTPUT_DIR ||
     path.join(projectRoot, "extension-updates")
@@ -136,6 +137,7 @@ async function main() {
     recursive: true,
     filter: (src) => {
       const name = path.basename(src);
+      if (name === ".git" || name === "config.local.js" || name === "native-host") return false;
       return ![".pem", ".crx"].includes(path.extname(name).toLowerCase());
     },
   });
@@ -164,6 +166,14 @@ async function main() {
 
   const pem = await fs.readFile(keyPath, "utf8");
   const extensionId = extensionIdFromPem(pem);
+  const nativeHostOutputDir = path.join(outputRoot, "native-host");
+  await ensureCleanDir(nativeHostOutputDir);
+  await fs.cp(nativeHostSourceDir, nativeHostOutputDir, { recursive: true });
+  await fs.writeFile(
+    path.join(nativeHostOutputDir, "install-production.ps1"),
+    `& (Join-Path $PSScriptRoot "install-native-host.ps1") -ExtensionId "${extensionId}" -Browser Both\n`,
+    "utf8"
+  );
   const crxFile = `rainbow-collector-${version}.crx`;
   const targetCrx = path.join(crxRoot, crxFile);
   await fs.rm(targetCrx, { force: true });
@@ -201,6 +211,7 @@ async function main() {
     update_url: updateUrl,
     crx_path: targetCrx,
     releases_path: path.join(outputRoot, "releases.json"),
+    native_host_path: nativeHostOutputDir,
     private_key_path: keyPath,
     chrome_path: chromePath,
   });
@@ -227,6 +238,7 @@ async function main() {
     update_url: updateUrl,
     crx_path: targetCrx,
     releases_path: path.join(outputRoot, "releases.json"),
+    native_host_path: nativeHostOutputDir,
   }, null, 2));
 }
 

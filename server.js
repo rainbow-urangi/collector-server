@@ -38,6 +38,11 @@ const {
 const {
   registerExtensionUpdateRoutes,
 } = require("./src/extensionUpdate");
+const {
+  issueCollectorDeviceToken,
+  verifyCollectorDeviceToken,
+} = require("./src/collectorDeviceToken");
+const { normalizePublicIp } = require("./src/networkAddress");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
 
@@ -51,7 +56,14 @@ app.use(helmet()); // 미들웨어를 추가하는 메서드(HTTP 헤더 자동 
 const corsOptions = { // cors 옵션 설정
   origin: (origin, cb) => cb(null, true), // 모든 Origin 허용(초기 수집 단계)
   methods: ["GET", "POST", "OPTIONS"], // 허용된 HTTP 메서드
-  allowedHeaders: ["Content-Type", "x-api-key"], // 허용된 헤더
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-api-key",
+    "X-Collector-Key",
+    "X-Collector-Version",
+    "X-Tenant-Id",
+  ], // 허용된 헤더
   maxAge: 86400, // CORS 설정을 브라우저가 캐시할 시간 (초 단위)
 };
 app.use(cors(corsOptions)); // corsOptions 적용
@@ -171,17 +183,38 @@ const collectorKeyOptions = {
 validateKeySeparation(collectorKeyOptions);
 const IDENTITY_HMAC_SECRET = process.env.IDENTITY_HMAC_SECRET || "";
 const IDENTITY_ALLOCATOR_INTERVAL_MS = Number(process.env.IDENTITY_ALLOCATOR_INTERVAL_MS || 3000);
+const COLLECTOR_DEVICE_TOKEN_SECRET =
+  process.env.COLLECTOR_DEVICE_TOKEN_SECRET || IDENTITY_HMAC_SECRET;
+const COLLECTOR_DEVICE_TOKEN_TTL_MS = Number(
+  process.env.COLLECTOR_DEVICE_TOKEN_TTL_MS || 7 * 24 * 60 * 60 * 1000
+);
 const IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_TENANT_SCAN_LIMIT || 20);
 const IDENTITY_ALLOCATOR_BATCH_LIMIT = Number(process.env.IDENTITY_ALLOCATOR_BATCH_LIMIT || 200);
 
 function requireApiKey(req, res, next) {
   // 창 종료 시 api_key 쿼리 파라미터 사용 가능
   const k = req.get("x-api-key") || req.query.api_key; // 요청 헤더에서 x-api-key 헤더 값 또는 쿼리 파라미터에서 api_key 값 가져옴
-  const identity = resolveCollectorIdentity(k, collectorKeyOptions);
+  let identity = resolveCollectorIdentity(k, collectorKeyOptions);
+  let deviceClaims = null;
+  if (!identity) {
+    const match = /^Bearer\s+(.+)$/i.exec(req.get("authorization") || "");
+    deviceClaims = match
+      ? verifyCollectorDeviceToken(match[1], COLLECTOR_DEVICE_TOKEN_SECRET)
+      : null;
+    if (deviceClaims) {
+      identity = {
+        environment: "production",
+        tenantId: collectorKeyOptions.productionTenantId || null,
+      };
+    }
+  }
   if (!identity) return res.status(401).json({ error: "unauthorized" });
   req.collectorContext = {
     ...identity,
     pool: databasePools.get(identity.environment) || null,
+    authMethod: deviceClaims ? "device_token_auto_production" : "api_key",
+    installationId: deviceClaims?.sub || null,
+    extensionId: deviceClaims?.ext || null,
   };
   next();
 }
@@ -290,11 +323,17 @@ const isKnownUserId = (v) => {
 // user_id 보강: unknown 대신 새 값 사용
 const betterUserId = (prev, next) => {
   const p = SAFE(prev), n = SAFE(next); // prev: 이전 값, next: 새 값 모두 SAFE 함수로 정리
-  if (!isKnownUserId(n)) return isKnownUserId(p) ? p : null;
-  if (!isKnownUserId(p)) return n;
+  if (!isKnownUserId(n)) return p || "unknown";
+  if (!isKnownUserId(p) || p.startsWith("device:")) return n;
   // if (!n || n.toLowerCase() === "unknown") return p || null; // n이 null 또는 undefined 이거나 "unknown"이면 p 반환
   // if (!p || p.toLowerCase() === "unknown") return n; // p가 null 또는 undefined 이거나 "unknown"이면 n 반환
   return p; // p 반환
+};
+
+const collectorDeviceUserId = (row) => {
+  const locators = safeJSON(row?.AZ_locators_json);
+  const installationId = SAFE(locators?.collector_auth?.installation_id);
+  return installationId ? `device:${installationId}` : "unknown";
 };
 
 // multi-tenant (여러 조직이 하나의 시스템을 공유하도록 지원)
@@ -654,6 +693,28 @@ function assignCausalLinkHints(rows, cacheNamespace = "production") {
   }
 }
 
+function requestIdFromLocators(value) {
+  const locators = safeJSON(value) || {};
+  const raw = locators.raw_payload && typeof locators.raw_payload === "object"
+    ? locators.raw_payload
+    : {};
+  const api =
+    locators.api_context ||
+    raw.api_context ||
+    locators.payload_hint?.api ||
+    {};
+  return limitedSafe(firstSafe(api.request_id, api.requestId), 128);
+}
+
+function taskNameForRow(row) {
+  const requestId = requestIdFromLocators(row?.AZ_locators_json);
+  if (requestId) return limitedSafe(`${TASK_NAME}:request:${requestId}`, 255);
+
+  const relation = relationContextFromLocators(safeJSON(row?.AZ_locators_json) || {});
+  const key = relation.relatedInteractionId || relation.interactionId || row?.AZ_event_id || "unlinked";
+  return limitedSafe(`${TASK_NAME}:interaction:${key}`, 255);
+}
+
 function actionFromLocatorsJson(value) {
   const locators = safeJSON(value);
   const action =
@@ -819,9 +880,29 @@ function assignActorWorkflowHints(rows, idleMs = WORKFLOW_IDLE_MS, cacheNamespac
 function enrichRow(row, clientIp, tenantId) {
   const r = { ...row }; //  객체 스프레드 (복사본 생성)
 
-  // 서버 관측 IP (확장 프로그램에서 직접 얻기 어려움)
-  if (!r.AZ_ip_address || r.AZ_ip_address === "(unavailable-in-extension)")
-    r.AZ_ip_address = clientIp || null;
+  const originalLocators = safeJSON(r.AZ_locators_json);
+  const locators = originalLocators && typeof originalLocators === "object" && !Array.isArray(originalLocators)
+    ? { ...originalLocators }
+    : {};
+  const originalNetwork = locators.network_context;
+  const networkContext = originalNetwork && typeof originalNetwork === "object" && !Array.isArray(originalNetwork)
+    ? { ...originalNetwork }
+    : {};
+  const collectorIp = networkContext.confidence === "high"
+    ? SAFE(networkContext.preferred_ipv4)
+    : null;
+  const originalRowIp = SAFE(r.AZ_ip_address);
+  const collectorRowIp = originalRowIp && originalRowIp !== "(unavailable-in-extension)"
+    ? originalRowIp
+    : null;
+  const publicObservedIp = normalizePublicIp(clientIp);
+  r.AZ_ip_address = collectorIp || collectorRowIp || publicObservedIp || null;
+  networkContext.server_observed_ip = clientIp || null;
+  networkContext.selected_ip_source = collectorIp
+    ? "collector_local_high_confidence"
+    : (collectorRowIp ? "collector_row" : (publicObservedIp ? "server_observed_public" : "unavailable"));
+  locators.network_context = networkContext;
+  r.AZ_locators_json = locators;
 
   // 테넌트
   //r._tenant_id = tenantId || null; // 테넌트 적재가 막혀 주석처리 (tenant_id가 무조건 NULL로 저장되어 테넌트 정보 유실)
@@ -1019,7 +1100,7 @@ function batchAggregateSessions(rows) {
 
     const cur =
       map.get(sid) || {
-        user_id: SAFE(r.AZ_login_id) || "unknown",
+        user_id: SAFE(r.AZ_login_id) || collectorDeviceUserId(r),
         tenant_id: r._tenant_id || null,
         start: r.AZ_event_time,
         end: r.AZ_event_time,
@@ -1029,12 +1110,13 @@ function batchAggregateSessions(rows) {
         vw: null,
         vh: null,
         browser_id: null,
+        verified_ip: null,
       };
 
     if (r.AZ_event_time < cur.start) cur.start = r.AZ_event_time;
     if (r.AZ_event_time > cur.end) cur.end = r.AZ_event_time;
 
-    cur.user_id = betterUserId(cur.user_id, r.AZ_login_id);
+    cur.user_id = betterUserId(cur.user_id, r.AZ_login_id) || collectorDeviceUserId(r);
     cur.tenant_id = cur.tenant_id || r._tenant_id || null;
 
     if (!cur.ua) {
@@ -1052,7 +1134,17 @@ function batchAggregateSessions(rows) {
     if (!cur.browser_id && SAFE(r.AZ_session_browser_id))
       cur.browser_id = SAFE(r.AZ_session_browser_id);
 
-    if (!cur.ip && SAFE(r.AZ_ip_address)) cur.ip = r.AZ_ip_address;
+    const locators = safeJSON(r.AZ_locators_json);
+    const networkContext = locators?.network_context;
+    const verifiedIp = networkContext?.confidence === "high"
+      ? SAFE(networkContext.preferred_ipv4)
+      : null;
+    if (verifiedIp) {
+      cur.ip = verifiedIp;
+      cur.verified_ip = verifiedIp;
+    } else if (!cur.ip && SAFE(r.AZ_ip_address)) {
+      cur.ip = r.AZ_ip_address;
+    }
 
     map.set(sid, cur);
   }
@@ -1226,20 +1318,38 @@ async function processBatch(
             browser_id      = COALESCE(sessions.browser_id,      VALUES(browser_id)),
             -- ★ 기존이 NULL/빈문자/'unknown'이면 새 login_id로 승격
             user_id       = CASE
-                              WHEN (sessions.user_id IS NULL OR sessions.user_id='' OR LOWER(sessions.user_id)='unknown')
+                              WHEN (sessions.user_id IS NULL OR sessions.user_id='' OR LOWER(sessions.user_id)='unknown' OR sessions.user_id LIKE 'device:%')
                                   AND (VALUES(user_id) IS NOT NULL AND VALUES(user_id)<>'' AND LOWER(VALUES(user_id))<>'unknown')
                               THEN VALUES(user_id)
                               ELSE sessions.user_id
                             END`,
         values
       );
+
+      const verifiedSessions = Array.from(sessAgg.entries())
+        .filter(([, session]) => SAFE(session.verified_ip));
+      if (verifiedSessions.length) {
+        const cases = [];
+        const params = [];
+        const ids = [];
+        for (const [sid, session] of verifiedSessions) {
+          cases.push("WHEN ? THEN ?");
+          params.push(sid, session.verified_ip);
+          ids.push(sid);
+        }
+        params.push(...ids);
+        await conn.query(
+          `UPDATE sessions
+              SET ip_address = CASE id ${cases.join(" ")} ELSE ip_address END
+            WHERE id IN (${ids.map(() => "?").join(",")})`,
+          params
+        );
+      }
     }
 
     // 2) 태스크 보장
-    await ensureTasks(conn, Array.from(sessAgg.keys()));
-
     // 3) 각 행 처리
-    const taskIdCache = new Map(); // sid -> taskId
+    const taskIdCache = new Map(); // session_id + request/interaction task name -> taskId
     const perTaskMin = new Map(),
       perTaskMax = new Map();
     let totalEvents = 0,
@@ -1261,23 +1371,59 @@ async function processBatch(
         );
       }
 
-      // 태스크 확보
-      let taskId = taskIdCache.get(sid);
+      // Request/Response 단위 태스크 확보. UI 원인 이벤트는 첫 API 요청이 도착하면 같은 태스크로 승격한다.
+      const taskName = taskNameForRow(r);
+      const taskCacheKey = `${sid}\u0000${taskName}`;
+      let taskId = taskIdCache.get(taskCacheKey);
       if (!taskId) {
         const [row] = await conn.query(
           `SELECT id FROM tasks WHERE session_id=? AND task_name=? LIMIT 1`,
-          [sid, TASK_NAME]
+          [sid, taskName]
         );
         if (row?.id) taskId = row.id;
         else {
-          const res = await conn.query(
-            `INSERT INTO tasks (session_id, task_name, status, start_time)
-              VALUES (?, ?, 'IN_PROGRESS', ?)`,
-            [sid, TASK_NAME, r.AZ_event_time]
-          );
-          taskId = res.insertId;
+          const requestId = requestIdFromLocators(r.AZ_locators_json);
+          if (requestId && supportsCausalColumns && r._related_interaction_id) {
+            const [candidate] = await conn.query(
+              `SELECT t.id, t.task_name
+                 FROM events e
+                 INNER JOIN tasks t ON t.id = e.task_id
+                WHERE e.session_id = ?
+                  AND e.causal_chain_id = ?
+                ORDER BY e.event_time DESC, e.id DESC
+                LIMIT 1`,
+              [sid, r._related_interaction_id]
+            );
+            if (candidate?.id && !String(candidate.task_name || "").includes(":request:")) {
+              await conn.query(`UPDATE tasks SET task_name = ? WHERE id = ?`, [taskName, candidate.id]);
+              taskId = candidate.id;
+            }
+          }
+          if (!taskId && !requestId && supportsCausalColumns && r._causal_chain_id) {
+            const [requestTask] = await conn.query(
+              `SELECT t.id
+                 FROM events e
+                 INNER JOIN tasks t ON t.id = e.task_id
+                WHERE e.session_id = ?
+                  AND e.causal_chain_id = ?
+                  AND t.task_name LIKE CONCAT(?, ':request:%')
+                ORDER BY e.event_time, e.id
+                LIMIT 1`,
+              [sid, r._causal_chain_id, TASK_NAME]
+            );
+            taskId = requestTask?.id || null;
+          }
+          if (!taskId) {
+            const res = await conn.query(
+              `INSERT INTO tasks (session_id, task_name, status, start_time)
+                VALUES (?, ?, 'IN_PROGRESS', ?)
+                ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)`,
+              [sid, taskName, r.AZ_event_time]
+            );
+            taskId = res.insertId;
+          }
         }
-        taskIdCache.set(sid, taskId);
+        taskIdCache.set(taskCacheKey, taskId);
       }
 
       const MAX_TEXT_BYTES = 60000;
@@ -1502,7 +1648,46 @@ async function processBatch(
 // ───────────────────── 라우트 ─────────────────────
 registerExtensionUpdateRoutes(app);
 
+function handleCollectorBootstrap(req, res) {
+  let body = req.body;
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { body = null; }
+  }
+
+  try {
+    const issued = issueCollectorDeviceToken({
+      installationId: body?.installation_id,
+      extensionId: body?.extension_id,
+      ttlMs: COLLECTOR_DEVICE_TOKEN_TTL_MS,
+    }, COLLECTOR_DEVICE_TOKEN_SECRET);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      access_token: issued.token,
+      expires_at_ms: issued.expiresAtMs,
+      collector_environment: "production",
+    });
+  } catch (error) {
+    const missingSecret = error?.message === "collector_device_token_secret_missing";
+    res.status(missingSecret ? 503 : 400).json({
+      error: missingSecret ? "collector_bootstrap_unavailable" : "invalid_collector_identity",
+    });
+  }
+}
+
+app.post("/collector/bootstrap", handleCollectorBootstrap);
+app.post("/ingest/batch", (req, res, next) => {
+  if (req.query.bootstrap !== "device-token") return next();
+  return handleCollectorBootstrap(req, res);
+});
+
 app.get("/collector/runtime-config", requireApiKey, (req, res) => {
+  res.json(buildQualityRuntimeConfig({
+    environment: req.collectorContext?.environment || PRIMARY_DB_ENVIRONMENT,
+  }));
+});
+app.get("/ingest/batch", requireApiKey, (req, res) => {
+  if (req.query.runtime_config !== "1") return res.status(405).json({ error: "method_not_allowed" });
   res.json(buildQualityRuntimeConfig({
     environment: req.collectorContext?.environment || PRIMARY_DB_ENVIRONMENT,
   }));
@@ -1642,6 +1827,18 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
     const filled = rows.map((r) => {
       const o = {};
       for (const k of ALL_50) o[k] = Object.prototype.hasOwnProperty.call(r, k) ? r[k] : null;
+      if (collectorContext.authMethod === "device_token_auto_production") {
+        const locators = safeJSON(o.AZ_locators_json);
+        o.AZ_locators_json = {
+          ...(locators && typeof locators === "object" && !Array.isArray(locators) ? locators : {}),
+          collector_auth: {
+            method: collectorContext.authMethod,
+            installation_id: collectorContext.installationId,
+            extension_id: collectorContext.extensionId,
+            environment: "production",
+          },
+        };
+      }
       // per-row tenant 상향
       o._tenant_id = tenantIdPerRow(r);
       return o;

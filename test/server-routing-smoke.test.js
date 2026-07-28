@@ -110,6 +110,40 @@ test("keeps the existing production key and runtime-config behavior", async () =
   });
 });
 
+test("self-enrolls a config-free extension into production routing", async () => {
+  await withServer({}, async (port) => {
+    const bootstrap = await fetch(`http://127.0.0.1:${port}/ingest/batch?bootstrap=device-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        installation_id: "install-routing-smoke-123456",
+        extension_id: "abcdefghijklmnopabcdefghijklmnop",
+      }),
+    });
+    const enrollment = await bootstrap.json();
+    assert.equal(bootstrap.status, 200);
+    assert.equal(enrollment.collector_environment, "production");
+    assert.equal(typeof enrollment.access_token, "string");
+
+    const runtimeConfig = await fetch(`http://127.0.0.1:${port}/ingest/batch?runtime_config=1`, {
+      headers: { Authorization: `Bearer ${enrollment.access_token}` },
+    });
+    assert.equal(runtimeConfig.status, 200);
+
+    const ingest = await fetch(`http://127.0.0.1:${port}/ingest/batch`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${enrollment.access_token}`,
+      },
+      body: JSON.stringify({ rows: [] }),
+    });
+    const ingestBody = await ingest.json();
+    assert.equal(ingest.status, 400);
+    assert.equal(ingestBody.error, "empty_rows");
+  });
+});
+
 test("fails closed when a test key has no test database pool", async () => {
   await withServer({
     TEST_API_KEY: "test_key",
