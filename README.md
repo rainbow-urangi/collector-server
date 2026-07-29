@@ -72,6 +72,7 @@ TRUST_PROXY=0
 API_KEY=local-dev-test-key-12345
 TEST_API_KEY=test_key
 TEST_TENANT_ID=test_company
+SITE_TENANT_MAP={"http://211.109.22.33:8791":"excampus_211_109_22_33_8791"}
 COLLECTOR_DB_ENV=production
 
 DB_HOST=127.0.0.1
@@ -103,6 +104,7 @@ COLLECTOR_MAX_RESPONSE_BODY_BYTES=200000
 * `TEST_API_KEY`: 테스트 DB로만 저장할 테스트 인증 키
 * `TENANT_KEYS`: 운영 키와 운영 테넌트의 JSON 매핑
 * `TEST_TENANT_KEYS`: 테스트 키와 테스트 테넌트의 JSON 매핑
+* `SITE_TENANT_MAP`: 인증 키에 tenant가 없을 때 허용된 사이트 origin을 tenant로 매핑하는 JSON
 * `COLLECTOR_DB_ENV`: 기존 `DB_*`가 가리키는 환경 (`production` 기본값 또는 `test`)
 * `DB_*`: MariaDB 연결 정보
 * `TEST_DB_*`: 기본 환경이 운영일 때 사용할 테스트 MariaDB 연결 정보

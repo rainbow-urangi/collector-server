@@ -42,6 +42,11 @@ const {
   issueCollectorDeviceToken,
   verifyCollectorDeviceToken,
 } = require("./src/collectorDeviceToken");
+const {
+  applyCollectorIdentityContext,
+  sessionUserIdOf,
+} = require("./src/collectorIdentityContext");
+const { resolveSiteTenantId } = require("./src/siteTenant");
 const { normalizePublicIp } = require("./src/networkAddress");
 const { RateLimiterMemory } = require("rate-limiter-flexible"); // rate-limiter-flexible 요청 횟수 제한 라이브러리
 // rate-limiter-flexible에서 RateLimiterMemory 모듈만 불러옴
@@ -172,6 +177,7 @@ const TEST_TENANT_KEY_MAP = readKeyMapFromEnvironment(
   "TEST_TENANT_KEYS",
   "test_tenant_keys"
 );
+const SITE_TENANT_MAP = readKeyMapFromEnvironment("SITE_TENANT_MAP", "site_tenant_map");
 const collectorKeyOptions = {
   productionApiKey: process.env.API_KEY || "",
   productionTenantId: process.env.PRODUCTION_TENANT_ID || null,
@@ -344,7 +350,7 @@ const collectorDeviceUserId = (row) => {
 //   SAFE(req.get("x-tenant")) ||
 //   null;
 const parseTenantId = (req, row) => {
-  return req.collectorContext?.tenantId || null;
+  return req.collectorContext?.tenantId || resolveSiteTenantId(row, SITE_TENANT_MAP) || null;
 };
 
 // 길이 클램프 & 정규화 유틸
@@ -904,8 +910,8 @@ function enrichRow(row, clientIp, tenantId) {
   locators.network_context = networkContext;
   r.AZ_locators_json = locators;
 
-  // 테넌트
-  //r._tenant_id = tenantId || null; // 테넌트 적재가 막혀 주석처리 (tenant_id가 무조건 NULL로 저장되어 테넌트 정보 유실)
+  // 라우트에서 확정한 row별 tenant를 우선하고, 직접 호출 경로에서는 batch tenant를 사용한다.
+  r._tenant_id = r._tenant_id || tenantId || null;
 
   // URL 파생
   r.AZ_url_host = r.AZ_url_host || hostOf(r.AZ_url); // URL 호스트 추출
@@ -1100,7 +1106,7 @@ function batchAggregateSessions(rows) {
 
     const cur =
       map.get(sid) || {
-        user_id: SAFE(r.AZ_login_id) || collectorDeviceUserId(r),
+        user_id: sessionUserIdOf(r) || SAFE(r.AZ_login_id) || collectorDeviceUserId(r),
         tenant_id: r._tenant_id || null,
         start: r.AZ_event_time,
         end: r.AZ_event_time,
@@ -1116,7 +1122,8 @@ function batchAggregateSessions(rows) {
     if (r.AZ_event_time < cur.start) cur.start = r.AZ_event_time;
     if (r.AZ_event_time > cur.end) cur.end = r.AZ_event_time;
 
-    cur.user_id = betterUserId(cur.user_id, r.AZ_login_id) || collectorDeviceUserId(r);
+    const explicitUserId = sessionUserIdOf(r);
+    cur.user_id = explicitUserId || betterUserId(cur.user_id, r.AZ_login_id) || collectorDeviceUserId(r);
     cur.tenant_id = cur.tenant_id || r._tenant_id || null;
 
     if (!cur.ua) {
@@ -1170,6 +1177,7 @@ async function ensureTasks(conn, sessionIds) {
 
 // 세션ID 해석/생성
 async function resolveOrCreateSession(conn, r) {
+  const sessionUserId = sessionUserIdOf(r) || SAFE(r.AZ_login_id);
   // 1) page_session_id
   if (SAFE(r.AZ_session_page_id)) return r.AZ_session_page_id;
 
@@ -1182,12 +1190,12 @@ async function resolveOrCreateSession(conn, r) {
   }
 
   // 3) 사용자/시간 기반 귀속
-  if (isKnownUserId(r.AZ_login_id)) {
+  if (isKnownUserId(sessionUserId)) {
     const [row] = await conn.query(
       `SELECT id FROM sessions
-        WHERE user_id = ? AND start_time <= ? AND (end_time IS NULL OR end_time >= ?)
+        WHERE user_id = ? AND (tenant_id <=> ?) AND start_time <= ? AND (end_time IS NULL OR end_time >= ?)
         ORDER BY end_time DESC LIMIT 1`,
-      [r.AZ_login_id.trim(), r.AZ_event_time, r.AZ_event_time]
+      [sessionUserId.trim(), r._tenant_id || null, r.AZ_event_time, r.AZ_event_time]
     );
     if (row?.id) return row.id;
   }
@@ -1199,7 +1207,7 @@ async function resolveOrCreateSession(conn, r) {
   const w = toUInt(r.AZ_viewport_w),
     h = toUInt(r.AZ_viewport_h);
   const viewport = w && h ? `${w}x${h}` : null;
-  const userId = isKnownUserId(r.AZ_login_id) ? r.AZ_login_id.trim() : "unknown";
+  const userId = isKnownUserId(sessionUserId) ? sessionUserId.trim() : "unknown";
   const browserId = SAFE(r.AZ_session_browser_id) || null;
 
   await conn.query(
@@ -1267,7 +1275,10 @@ async function processBatch(
 
   // 0) 보강
   const norm = rows.map((r) =>
-    applyIdentity(enrichRow(r, clientIp, tenantId), IDENTITY_HMAC_SECRET)
+    applyIdentity(
+      applyCollectorIdentityContext(enrichRow(r, clientIp, tenantId)),
+      IDENTITY_HMAC_SECRET
+    )
   );
   // 분석용 actor workflow 힌트 생성 (DB task/task_id 의미는 그대로 유지) 
   assignActorWorkflowHints(norm, WORKFLOW_IDLE_MS, cacheNamespace);
@@ -1360,8 +1371,16 @@ async function processBatch(
       // 세션ID
       const sid = await resolveOrCreateSession(conn, r);
 
-      // 로그인ID 승격(최후 보루)
-      if (isKnownUserId(r.AZ_login_id)) {
+      // 확인된 사이트 사용자 ID는 기존 fallback identity보다 우선한다.
+      const explicitUserId = sessionUserIdOf(r);
+      if (isKnownUserId(explicitUserId)) {
+        await conn.query(
+          `UPDATE sessions
+              SET user_id = ?, tenant_id = COALESCE(tenant_id, ?)
+            WHERE id = ?`,
+          [explicitUserId.trim(), r._tenant_id || null, sid]
+        );
+      } else if (isKnownUserId(r.AZ_login_id)) {
         await conn.query(
           `UPDATE sessions
               SET user_id = ?
@@ -1861,6 +1880,9 @@ app.post("/ingest/batch", requireApiKey, async (req, res) => {
     res.json({
       ok: true,
       collector_environment: collectorContext.environment,
+      collector_tenant_ids: [...new Set(
+        guarded.rows.map((row) => row?._tenant_id).filter(Boolean)
+      )],
       received_rows: rows.length,
       inserted_events: result.inserted,
       duplicate_events: result.duplicates,
